@@ -5,10 +5,11 @@ Built for comfortable trackpad use, color-blind-friendly UI chrome, and a clean 
 
 | | |
 |--|--|
+| **Repo** | https://github.com/bootdsc/PixelPainter |
 | **License** | [CC BY-NC-SA 4.0](LICENSE) — free to use, share, and modify **with attribution**; **not for sale** / commercial redistribution |
 | **Default canvas** | **32×32** |
 | **UI theme** | Dark gray / light gray / green only (no red/blue chrome) |
-| **Portable app** | `dist/PixelPainter.exe` (Windows) |
+| **Portable app** | [Releases](https://github.com/bootdsc/PixelPainter/releases) → `PixelPainter.exe` |
 
 ---
 
@@ -16,9 +17,7 @@ Built for comfortable trackpad use, color-blind-friendly UI chrome, and a clean 
 
 ### Windows portable EXE
 
-```
-dist/PixelPainter.exe
-```
+Download from **[Releases](https://github.com/bootdsc/PixelPainter/releases)** (`PixelPainter.exe`).
 
 Copy that single file anywhere. No Python install required.
 
