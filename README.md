@@ -41,6 +41,8 @@ Requires Python 3.10+ and Pillow.
 - Brush sizes 1×1 … 4×4
 - **Space + drag** — erase while Paint is selected (trackpad-friendly)
 - Grid size 1–256 per side (default **32×32**)
+- **Import & pixelate** (`Ctrl+I`) — open any photo/sprite, **block-size slider**,
+  **click-drag** to shift the sample grid so edges line up, then Apply
 
 ### Navigation
 - **Scrollbars** when the image is larger than the window

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 try:
-    from PIL import Image, ImageTk, ImageGrab
+    from PIL import Image, ImageTk, ImageGrab, ImageDraw
 except ImportError:
     print("Pillow required:  pip install Pillow")
     sys.exit(1)
@@ -575,6 +575,7 @@ class PixelPainterApp:
                          activebackground=Theme.GREEN_DK, activeforeground=Theme.FG)
         file_m.add_command(label="New…", command=self.cmd_new, accelerator="Ctrl+N")
         file_m.add_command(label="Open…", command=self.cmd_open, accelerator="Ctrl+O")
+        file_m.add_command(label="Import & pixelate…", command=self.cmd_pixelate_import, accelerator="Ctrl+I")
         file_m.add_command(label="Save", command=self.cmd_save, accelerator="Ctrl+S")
         file_m.add_command(label="Save As…", command=self.cmd_save_as, accelerator="Ctrl+Shift+S")
         file_m.add_separator()
@@ -867,6 +868,7 @@ class PixelPainterApp:
         for text, cmd in [
             ("New grid…", self.cmd_new),
             ("Resize…", self.cmd_resize),
+            ("Import & pixelate…", self.cmd_pixelate_import),
             ("Save As…", self.cmd_save_as),
             ("Export PNG…", self.cmd_export_png),
             ("Export C…", self.cmd_export_c),
@@ -890,6 +892,8 @@ class PixelPainterApp:
         r = self.root
         r.bind("<Control-n>", lambda e: self.cmd_new())
         r.bind("<Control-o>", lambda e: self.cmd_open())
+        r.bind("<Control-i>", lambda e: self.cmd_pixelate_import())
+        r.bind("<Control-I>", lambda e: self.cmd_pixelate_import())
         r.bind("<Control-s>", lambda e: self.cmd_save())
         r.bind("<Control-S>", lambda e: self.cmd_save_as())
         r.bind("1", lambda e: self._set_brush(1))
@@ -1697,9 +1701,25 @@ class PixelPainterApp:
         img = Image.open(path).convert("RGBA")
         w, h = img.size
         if w > 256 or h > 256:
-            raise ValueError("PNG larger than 256×256 — resize first")
-        # Build palette from unique colors
-        colors = {}
+            raise ValueError(
+                "PNG larger than 256×256 — use File → Import & pixelate… "
+                "to downscale with grid alignment first"
+            )
+        doc = self._rgba_image_to_doc(img)
+        doc.path = None
+        doc.dirty = True
+        add_recent(path)
+        return doc
+
+    def _rgba_image_to_doc(self, img: Image.Image, max_colors: int = 64) -> PixelDocument:
+        """Convert RGBA PIL image into a PixelDocument (palette indices)."""
+        img = img.convert("RGBA")
+        w, h = img.size
+        if w < 1 or h < 1:
+            raise ValueError("Empty image")
+        if w > 256 or h > 256:
+            raise ValueError("Result larger than 256×256")
+        colors: dict = {}
         palette = ["#000000"]  # 0 transparent / black
         px = img.load()
         pixels = [[0 for _ in range(w)] for _ in range(h)]
@@ -1711,8 +1731,7 @@ class PixelPainterApp:
                     continue
                 key = (r, g, b)
                 if key not in colors:
-                    if len(palette) >= 64:
-                        # nearest existing
+                    if len(palette) >= max_colors:
                         best_i, best_d = 1, 1e9
                         for i, hexc in enumerate(palette):
                             if i == 0:
@@ -1728,10 +1747,247 @@ class PixelPainterApp:
                 pixels[y][x] = colors[key]
         doc = PixelDocument(w, h, palette)
         doc.pixels = pixels
-        doc.path = None
-        doc.dirty = True
-        add_recent(path)
         return doc
+
+    # ------------------------------------------------------------------
+    # Import & pixelate (resolution scaler + draggable sample grid)
+    # ------------------------------------------------------------------
+    def cmd_pixelate_import(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Import image to pixelate",
+            filetypes=[
+                ("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"),
+                ("All", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            src = Image.open(path).convert("RGBA")
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, f"Could not open image:\n{ex}", parent=self.root)
+            return
+        if src.width < 2 or src.height < 2:
+            messagebox.showerror(APP_NAME, "Image too small.", parent=self.root)
+            return
+        self._open_pixelate_dialog(src, path)
+
+    def _open_pixelate_dialog(self, src: Image.Image, source_path: str) -> None:
+        """
+        Live pixelation: block-size slider + click-drag to phase the sample grid.
+        Apply replaces the current document (after confirm if dirty).
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Import & pixelate")
+        dlg.configure(bg=Theme.BG_PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry("720x560")
+        dlg.minsize(560, 420)
+
+        sw, sh = src.size
+        # State: block size (source pixels per output pixel), grid offset
+        st = {
+            "block": max(2, min(32, max(sw, sh) // 32 or 2)),
+            "ox": 0,
+            "oy": 0,
+            "drag": None,  # (mx, my, ox0, oy0)
+            "photo": None,
+            "preview_img": None,
+        }
+
+        self._label(
+            dlg,
+            "Drag the preview to line up the pixel grid. Slider = block size (source px → 1 pixel).",
+            bg=Theme.BG_PANEL,
+            fg=Theme.FG_DIM,
+            wraplength=680,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=10, pady=(8, 4))
+
+        info = self._label(dlg, "", bg=Theme.BG_PANEL, fg=Theme.GREEN)
+        info.pack(anchor=tk.W, padx=10)
+
+        # Preview canvas (scrollable if huge)
+        prev_frame = tk.Frame(dlg, bg=Theme.BG)
+        prev_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        prev_frame.rowconfigure(0, weight=1)
+        prev_frame.columnconfigure(0, weight=1)
+        prev_cv = tk.Canvas(prev_frame, bg=Theme.CANVAS_BG, highlightthickness=1,
+                            highlightbackground=Theme.BORDER, cursor="fleur")
+        prev_cv.grid(row=0, column=0, sticky="nsew")
+
+        ctrl = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        ctrl.pack(fill=tk.X, padx=10, pady=6)
+
+        self._label(ctrl, "Block size", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
+        block_var = tk.IntVar(value=st["block"])
+
+        def out_size() -> Tuple[int, int]:
+            b = max(1, int(block_var.get()))
+            # usable region after offset
+            ow = max(1, (sw - st["ox"]) // b)
+            oh = max(1, (sh - st["oy"]) // b)
+            return ow, oh
+
+        def pixelate() -> Image.Image:
+            """Average each block → one pixel; NEAREST upscale for preview."""
+            b = max(1, int(block_var.get()))
+            ox, oy = st["ox"] % b, st["oy"] % b
+            # Align: start sampling at ox, oy
+            usable_w = sw - ox
+            usable_h = sh - oy
+            ow = max(1, usable_w // b)
+            oh = max(1, usable_h // b)
+            # Crop to aligned region then resize with BOX (area average)
+            crop = src.crop((ox, oy, ox + ow * b, oy + oh * b))
+            small = crop.resize((ow, oh), Image.Resampling.BOX)
+            return small
+
+        def refresh(_=None) -> None:
+            b = max(1, min(128, int(block_var.get())))
+            block_var.set(b)
+            st["block"] = b
+            # Clamp offsets into [0, b)
+            st["ox"] = int(st["ox"]) % b
+            st["oy"] = int(st["oy"]) % b
+            small = pixelate()
+            st["preview_img"] = small
+            ow, oh = small.size
+            # Scale preview to fit canvas (~ max 640x400)
+            prev_cv.update_idletasks()
+            cw = max(200, prev_cv.winfo_width() or 640)
+            ch = max(160, prev_cv.winfo_height() or 360)
+            scale = min(cw / max(1, ow), ch / max(1, oh), 32)
+            scale = max(1, int(scale))
+            big = small.resize((ow * scale, oh * scale), Image.Resampling.NEAREST)
+            # Draw grid lines on overlay for alignment feedback
+            if scale >= 4:
+                draw = ImageDraw.Draw(big)
+                gc = (92, 184, 92)  # green grid
+                for x in range(0, big.width + 1, scale):
+                    draw.line([(x, 0), (x, big.height - 1)], fill=gc)
+                for y in range(0, big.height + 1, scale):
+                    draw.line([(0, y), (big.width - 1, y)], fill=gc)
+            st["photo"] = ImageTk.PhotoImage(big)
+            prev_cv.delete("all")
+            prev_cv.create_image(cw // 2, ch // 2, image=st["photo"], anchor=tk.CENTER)
+            # Also show grid phase on source as dim overlay message
+            info.configure(
+                text=f"Output {ow}×{oh} px   ·   block {b}×{b}   ·   "
+                f"grid offset ({st['ox']}, {st['oy']})   ·   source {sw}×{sh}"
+            )
+            if ow > 256 or oh > 256:
+                info.configure(
+                    text=info.cget("text") + "   ·   too big — increase block size (max 256)"
+                )
+
+        def on_block(_=None) -> None:
+            b = max(1, int(block_var.get()))
+            st["ox"] %= b
+            st["oy"] %= b
+            refresh()
+
+        scale = tk.Scale(
+            ctrl,
+            from_=1,
+            to=64,
+            orient=tk.HORIZONTAL,
+            variable=block_var,
+            command=on_block,
+            bg=Theme.BG_PANEL,
+            fg=Theme.FG,
+            troughcolor=Theme.BG_INPUT,
+            highlightthickness=0,
+            activebackground=Theme.GREEN,
+            length=280,
+            showvalue=True,
+        )
+        scale.pack(side=tk.LEFT, padx=8)
+
+        def nudge(dx: int, dy: int) -> None:
+            b = max(1, int(block_var.get()))
+            st["ox"] = (st["ox"] + dx) % b
+            st["oy"] = (st["oy"] + dy) % b
+            refresh()
+
+        for lab, dx, dy in [("←", -1, 0), ("→", 1, 0), ("↑", 0, -1), ("↓", 0, 1)]:
+            bb = tk.Button(ctrl, text=lab, command=lambda a=dx, c=dy: nudge(a, c), width=3)
+            self._style_btn(bb)
+            bb.pack(side=tk.LEFT, padx=2)
+
+        def on_press(e) -> None:
+            st["drag"] = (e.x, e.y, st["ox"], st["oy"])
+
+        def on_drag(e) -> None:
+            if not st["drag"]:
+                return
+            x0, y0, ox0, oy0 = st["drag"]
+            b = max(1, int(block_var.get()))
+            # 1 screen-pixel drag → 1 source-pixel phase shift (wraps in block)
+            dx = e.x - x0
+            dy = e.y - y0
+            st["ox"] = (ox0 + dx) % b
+            st["oy"] = (oy0 + dy) % b
+            refresh()
+
+        def on_release(_e=None) -> None:
+            st["drag"] = None
+
+        prev_cv.bind("<ButtonPress-1>", on_press)
+        prev_cv.bind("<B1-Motion>", on_drag)
+        prev_cv.bind("<ButtonRelease-1>", on_release)
+        prev_cv.bind("<Configure>", lambda e: refresh())
+
+        btn_row = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        btn_row.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def apply() -> None:
+            small = pixelate()
+            ow, oh = small.size
+            if ow > 256 or oh > 256:
+                messagebox.showerror(
+                    APP_NAME,
+                    f"Result is {ow}×{oh}. Max is 256×256 — increase block size.",
+                    parent=dlg,
+                )
+                return
+            if not self._confirm_discard():
+                return
+            try:
+                self.doc = self._rgba_image_to_doc(small)
+                self.doc.path = None
+                self.doc.dirty = True
+                self.color_idx = min(1, len(self.doc.palette) - 1)
+                self.palette_count.set(len(self.doc.palette))
+                self.sel_cells = set()
+                self.float_items = []
+                self.moving = False
+                add_recent(source_path)
+                self._rebuild_palette_swatches()
+                self._rebuild_recent_menu()
+                self._refresh_title()
+                self._redraw()
+                dlg.destroy()
+            except Exception as ex:
+                messagebox.showerror(APP_NAME, str(ex), parent=dlg)
+
+        b_apply = tk.Button(btn_row, text="Apply to canvas", command=apply)
+        self._style_btn(b_apply, active=True)
+        b_apply.pack(side=tk.LEFT, padx=4)
+        b_cancel = tk.Button(btn_row, text="Cancel", command=dlg.destroy)
+        self._style_btn(b_cancel)
+        b_cancel.pack(side=tk.LEFT, padx=4)
+
+        self._label(
+            btn_row,
+            "Tip: drag preview to phase-align edges/features under the grid.",
+            bg=Theme.BG_PANEL,
+            fg=Theme.FG_DIM,
+        ).pack(side=tk.RIGHT, padx=8)
+
+        dlg.after(80, refresh)
 
     def cmd_save(self) -> None:
         if self.doc.path and self.doc.path.lower().endswith(".ppix"):
@@ -2124,6 +2380,8 @@ class PixelPainterApp:
                 "Box/Free select → Move → drag → Place (clips off-grid).\n"
                 "Pick→slot: screen color into current palette slot.\n"
                 "View menu: canvas background color.\n\n"
+                "Import & pixelate (Ctrl+I): slider = block size,\n"
+                "  drag preview to align the sample grid.\n\n"
                 "Keys: 1-4 brush  B/E/F/I  R box  L free  M move/place\n"
                 "  G grid  P pick  C wheel  Esc clear select  Space invert\n"
                 "  Alt+drag / middle-drag = pan  ·  Ctrl+/- zoom"
