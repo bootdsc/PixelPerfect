@@ -42,7 +42,10 @@ Requires Python 3.10+ and Pillow.
 - **Space + drag** — erase while Paint is selected (trackpad-friendly)
 - Grid size 1–256 per side (default **32×32**)
 - **Import & pixelate** (`Ctrl+I`) — open any photo/sprite, **block-size slider**,
-  **click-drag** to shift the sample grid so edges line up, then Apply
+  **max-colors** decimation (median-cut, no dither), **click-drag** to shift the
+  sample grid so edges line up, then Apply
+- **Replace drawn color** — remap every pixel of palette index A → index B  
+  (also: editing a swatch with the **Wheel** recolors all pixels using that slot)
 
 ### Navigation
 - **Scrollbars** when the image is larger than the window

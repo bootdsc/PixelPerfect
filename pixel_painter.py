@@ -595,6 +595,7 @@ class PixelPainterApp:
         edit_m.add_command(label="Clear canvas", command=self.cmd_clear)
         edit_m.add_separator()
         edit_m.add_command(label="Edit color (wheel)…", command=self.cmd_edit_color, accelerator="C")
+        edit_m.add_command(label="Replace drawn color…", command=self.cmd_replace_color)
         edit_m.add_command(label="Set palette size…", command=self.cmd_set_palette_size)
         edit_m.add_command(label="Screen pick → palette", command=self.cmd_screen_pick, accelerator="P")
         edit_m.add_separator()
@@ -774,6 +775,9 @@ class PixelPainterApp:
             b = tk.Button(btn_row, text=text, command=cmd)
             self._style_btn(b)
             b.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        b_rep = tk.Button(left, text="Replace all of color…", command=self.cmd_replace_color)
+        self._style_btn(b_rep)
+        b_rep.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         # Selection move / place (left side as requested)
         self._label(left, "SELECTION", font=("Segoe UI", 9, "bold"), bg=Theme.BG_PANEL).pack(
@@ -1711,9 +1715,51 @@ class PixelPainterApp:
         add_recent(path)
         return doc
 
+    @staticmethod
+    def _quantize_rgba(img: Image.Image, max_colors: int) -> Image.Image:
+        """
+        Decimate colors with Pillow median-cut (no dither).
+        max_colors = opaque palette size (transparent kept separate).
+        """
+        img = img.convert("RGBA")
+        w, h = img.size
+        max_colors = max(2, min(256, int(max_colors)))
+        src = img.load()
+        # RGB image for quantize; transparent pixels → magenta key then restored
+        rgb = Image.new("RGB", (w, h), (0, 0, 0))
+        rpx = rgb.load()
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = src[x, y]
+                if a < 128:
+                    rpx[x, y] = (0, 0, 0)
+                else:
+                    rpx[x, y] = (r, g, b)
+        # Use up to max_colors opaque colors
+        try:
+            q = rgb.quantize(
+                colors=max_colors,
+                method=Image.Quantize.MEDIANCUT,
+                dither=Image.Dither.NONE,
+            )
+        except Exception:
+            q = rgb.quantize(colors=max_colors, dither=Image.Dither.NONE)
+        qrgb = q.convert("RGB")
+        qpx = qrgb.load()
+        out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        opx = out.load()
+        for y in range(h):
+            for x in range(w):
+                if src[x, y][3] < 128:
+                    opx[x, y] = (0, 0, 0, 0)
+                else:
+                    r, g, b = qpx[x, y]
+                    opx[x, y] = (r, g, b, 255)
+        return out
+
     def _rgba_image_to_doc(self, img: Image.Image, max_colors: int = 64) -> PixelDocument:
         """Convert RGBA PIL image into a PixelDocument (palette indices)."""
-        img = img.convert("RGBA")
+        img = self._quantize_rgba(img, max_colors) if max_colors < 256 else img.convert("RGBA")
         w, h = img.size
         if w < 1 or h < 1:
             raise ValueError("Empty image")
@@ -1723,6 +1769,7 @@ class PixelPainterApp:
         palette = ["#000000"]  # 0 transparent / black
         px = img.load()
         pixels = [[0 for _ in range(w)] for _ in range(h)]
+        max_pal = max(2, min(64, max_colors + 1))  # +1 for transparent slot
         for y in range(h):
             for x in range(w):
                 r, g, b, a = px[x, y]
@@ -1731,7 +1778,7 @@ class PixelPainterApp:
                     continue
                 key = (r, g, b)
                 if key not in colors:
-                    if len(palette) >= max_colors:
+                    if len(palette) >= max_pal:
                         best_i, best_d = 1, 1e9
                         for i, hexc in enumerate(palette):
                             if i == 0:
@@ -1748,6 +1795,111 @@ class PixelPainterApp:
         doc = PixelDocument(w, h, palette)
         doc.pixels = pixels
         return doc
+
+    def cmd_replace_color(self) -> None:
+        """
+        Remap every drawn pixel of one palette index to another.
+        (Editing a swatch with the wheel already recolors that index in-place.)
+        """
+        src = self.color_idx
+        n = len(self.doc.palette)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Replace drawn color")
+        dlg.configure(bg=Theme.BG_PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        self._label(
+            dlg,
+            "Remap all pixels of one palette slot to another.\n"
+            "Tip: to recolor without remapping indices, just edit the\n"
+            "slot with Wheel — every pixel using that slot updates.",
+            bg=Theme.BG_PANEL,
+            fg=Theme.FG_DIM,
+            justify=tk.LEFT,
+        ).pack(padx=12, pady=8)
+
+        row = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        row.pack(padx=12, pady=4)
+        self._label(row, "From index:", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
+        from_var = tk.IntVar(value=src)
+        tk.Spinbox(
+            row, from_=0, to=max(0, n - 1), width=5, textvariable=from_var,
+            bg=Theme.BG_INPUT, fg=Theme.FG, buttonbackground=Theme.BG_PANEL,
+            highlightthickness=1, highlightbackground=Theme.BORDER,
+            insertbackground=Theme.FG,
+        ).pack(side=tk.LEFT, padx=6)
+        from_sw = tk.Canvas(row, width=28, height=22, bg=self.doc.palette[src],
+                            highlightthickness=1, highlightbackground=Theme.BORDER)
+        from_sw.pack(side=tk.LEFT, padx=4)
+
+        row2 = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        row2.pack(padx=12, pady=4)
+        self._label(row2, "To index:", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
+        to_default = 0 if src != 0 else min(1, n - 1)
+        to_var = tk.IntVar(value=to_default)
+        tk.Spinbox(
+            row2, from_=0, to=max(0, n - 1), width=5, textvariable=to_var,
+            bg=Theme.BG_INPUT, fg=Theme.FG, buttonbackground=Theme.BG_PANEL,
+            highlightthickness=1, highlightbackground=Theme.BORDER,
+            insertbackground=Theme.FG,
+        ).pack(side=tk.LEFT, padx=6)
+        to_sw = tk.Canvas(
+            row2, width=28, height=22,
+            bg=self.doc.palette[to_default],
+            highlightthickness=1, highlightbackground=Theme.BORDER,
+        )
+        to_sw.pack(side=tk.LEFT, padx=4)
+
+        count_lab = self._label(dlg, "", bg=Theme.BG_PANEL, fg=Theme.GREEN)
+        count_lab.pack(pady=4)
+
+        def sync_swatches(*_):
+            try:
+                fi = int(from_var.get())
+                ti = int(to_var.get())
+                fi = max(0, min(n - 1, fi))
+                ti = max(0, min(n - 1, ti))
+                from_sw.configure(bg=self.doc.palette[fi])
+                to_sw.configure(bg=self.doc.palette[ti])
+                cnt = sum(1 for row in self.doc.pixels for v in row if v == fi)
+                count_lab.configure(text=f"{cnt} pixels use index {fi}")
+            except Exception:
+                pass
+
+        from_var.trace_add("write", sync_swatches)
+        to_var.trace_add("write", sync_swatches)
+        sync_swatches()
+
+        def do_replace():
+            try:
+                fi = max(0, min(n - 1, int(from_var.get())))
+                ti = max(0, min(n - 1, int(to_var.get())))
+            except Exception:
+                return
+            if fi == ti:
+                dlg.destroy()
+                return
+            changed = 0
+            for y in range(self.doc.height):
+                for x in range(self.doc.width):
+                    if self.doc.pixels[y][x] == fi:
+                        self.doc.pixels[y][x] = ti
+                        changed += 1
+            if changed:
+                self.doc.dirty = True
+                self._redraw()
+                self._refresh_title()
+            dlg.destroy()
+            self.status.configure(text=f"Replaced {changed} pixels: {fi} → {ti}")
+
+        br = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        br.pack(pady=10)
+        b1 = tk.Button(br, text="Replace all", command=do_replace)
+        self._style_btn(b1, active=True)
+        b1.pack(side=tk.LEFT, padx=4)
+        b2 = tk.Button(br, text="Cancel", command=dlg.destroy)
+        self._style_btn(b2)
+        b2.pack(side=tk.LEFT, padx=4)
 
     # ------------------------------------------------------------------
     # Import & pixelate (resolution scaler + draggable sample grid)
@@ -1799,7 +1951,8 @@ class PixelPainterApp:
 
         self._label(
             dlg,
-            "Drag the preview to line up the pixel grid. Slider = block size (source px → 1 pixel).",
+            "Drag preview to phase-align the sample grid. "
+            "Block size = resolution scale. Max colors = palette decimation.",
             bg=Theme.BG_PANEL,
             fg=Theme.FG_DIM,
             wraplength=680,
@@ -1809,7 +1962,7 @@ class PixelPainterApp:
         info = self._label(dlg, "", bg=Theme.BG_PANEL, fg=Theme.GREEN)
         info.pack(anchor=tk.W, padx=10)
 
-        # Preview canvas (scrollable if huge)
+        # Preview canvas
         prev_frame = tk.Frame(dlg, bg=Theme.BG)
         prev_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
         prev_frame.rowconfigure(0, weight=1)
@@ -1819,53 +1972,52 @@ class PixelPainterApp:
         prev_cv.grid(row=0, column=0, sticky="nsew")
 
         ctrl = tk.Frame(dlg, bg=Theme.BG_PANEL)
-        ctrl.pack(fill=tk.X, padx=10, pady=6)
+        ctrl.pack(fill=tk.X, padx=10, pady=4)
+        ctrl2 = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        ctrl2.pack(fill=tk.X, padx=10, pady=4)
 
         self._label(ctrl, "Block size", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
         block_var = tk.IntVar(value=st["block"])
-
-        def out_size() -> Tuple[int, int]:
-            b = max(1, int(block_var.get()))
-            # usable region after offset
-            ow = max(1, (sw - st["ox"]) // b)
-            oh = max(1, (sh - st["oy"]) // b)
-            return ow, oh
+        colors_var = tk.IntVar(value=16)  # default readable palette for game assets
 
         def pixelate() -> Image.Image:
-            """Average each block → one pixel; NEAREST upscale for preview."""
+            """Average each block → one pixel, then optional color decimation."""
             b = max(1, int(block_var.get()))
             ox, oy = st["ox"] % b, st["oy"] % b
-            # Align: start sampling at ox, oy
             usable_w = sw - ox
             usable_h = sh - oy
             ow = max(1, usable_w // b)
             oh = max(1, usable_h // b)
-            # Crop to aligned region then resize with BOX (area average)
             crop = src.crop((ox, oy, ox + ow * b, oy + oh * b))
             small = crop.resize((ow, oh), Image.Resampling.BOX)
+            mc = max(2, min(64, int(colors_var.get())))
+            small = PixelPainterApp._quantize_rgba(small, mc)
             return small
 
         def refresh(_=None) -> None:
             b = max(1, min(128, int(block_var.get())))
             block_var.set(b)
             st["block"] = b
-            # Clamp offsets into [0, b)
             st["ox"] = int(st["ox"]) % b
             st["oy"] = int(st["oy"]) % b
+            try:
+                mc = max(2, min(64, int(colors_var.get())))
+                colors_var.set(mc)
+            except Exception:
+                mc = 16
+                colors_var.set(16)
             small = pixelate()
             st["preview_img"] = small
             ow, oh = small.size
-            # Scale preview to fit canvas (~ max 640x400)
             prev_cv.update_idletasks()
             cw = max(200, prev_cv.winfo_width() or 640)
             ch = max(160, prev_cv.winfo_height() or 360)
             scale = min(cw / max(1, ow), ch / max(1, oh), 32)
             scale = max(1, int(scale))
             big = small.resize((ow * scale, oh * scale), Image.Resampling.NEAREST)
-            # Draw grid lines on overlay for alignment feedback
             if scale >= 4:
                 draw = ImageDraw.Draw(big)
-                gc = (92, 184, 92)  # green grid
+                gc = (92, 184, 92)
                 for x in range(0, big.width + 1, scale):
                     draw.line([(x, 0), (x, big.height - 1)], fill=gc)
                 for y in range(0, big.height + 1, scale):
@@ -1873,10 +2025,20 @@ class PixelPainterApp:
             st["photo"] = ImageTk.PhotoImage(big)
             prev_cv.delete("all")
             prev_cv.create_image(cw // 2, ch // 2, image=st["photo"], anchor=tk.CENTER)
-            # Also show grid phase on source as dim overlay message
+            # Count unique opaque colors in preview
+            uniq = set()
+            spx = small.load()
+            for yy in range(oh):
+                for xx in range(ow):
+                    r, g, b, a = spx[xx, yy]
+                    if a >= 128:
+                        uniq.add((r, g, b))
             info.configure(
-                text=f"Output {ow}×{oh} px   ·   block {b}×{b}   ·   "
-                f"grid offset ({st['ox']}, {st['oy']})   ·   source {sw}×{sh}"
+                text=(
+                    f"Output {ow}×{oh} px   ·   block {b}×{b}   ·   "
+                    f"offset ({st['ox']}, {st['oy']})   ·   "
+                    f"max colors {mc} (≈{len(uniq)} used)   ·   source {sw}×{sh}"
+                )
             )
             if ow > 256 or oh > 256:
                 info.configure(
@@ -1905,6 +2067,30 @@ class PixelPainterApp:
             showvalue=True,
         )
         scale.pack(side=tk.LEFT, padx=8)
+
+        self._label(ctrl2, "Max colors", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
+        color_scale = tk.Scale(
+            ctrl2,
+            from_=2,
+            to=64,
+            orient=tk.HORIZONTAL,
+            variable=colors_var,
+            command=lambda _=None: refresh(),
+            bg=Theme.BG_PANEL,
+            fg=Theme.FG,
+            troughcolor=Theme.BG_INPUT,
+            highlightthickness=0,
+            activebackground=Theme.GREEN,
+            length=280,
+            showvalue=True,
+        )
+        color_scale.pack(side=tk.LEFT, padx=8)
+        self._label(
+            ctrl2,
+            "(median-cut, no dither)",
+            bg=Theme.BG_PANEL,
+            fg=Theme.FG_DIM,
+        ).pack(side=tk.LEFT, padx=4)
 
         def nudge(dx: int, dy: int) -> None:
             b = max(1, int(block_var.get()))
@@ -1956,7 +2142,8 @@ class PixelPainterApp:
             if not self._confirm_discard():
                 return
             try:
-                self.doc = self._rgba_image_to_doc(small)
+                mc = max(2, min(64, int(colors_var.get())))
+                self.doc = self._rgba_image_to_doc(small, max_colors=mc)
                 self.doc.path = None
                 self.doc.dirty = True
                 self.color_idx = min(1, len(self.doc.palette) - 1)
@@ -2380,8 +2567,10 @@ class PixelPainterApp:
                 "Box/Free select → Move → drag → Place (clips off-grid).\n"
                 "Pick→slot: screen color into current palette slot.\n"
                 "View menu: canvas background color.\n\n"
-                "Import & pixelate (Ctrl+I): slider = block size,\n"
-                "  drag preview to align the sample grid.\n\n"
+                "Import & pixelate (Ctrl+I): block size + max colors,\n"
+                "  drag preview to align the sample grid.\n"
+                "Replace drawn color: remap index A→B on the canvas.\n"
+                "  (Wheel-edit of a swatch also recolors that index.)\n\n"
                 "Keys: 1-4 brush  B/E/F/I  R box  L free  M move/place\n"
                 "  G grid  P pick  C wheel  Esc clear select  Space invert\n"
                 "  Alt+drag / middle-drag = pan  ·  Ctrl+/- zoom"
