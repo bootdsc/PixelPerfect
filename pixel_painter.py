@@ -193,6 +193,7 @@ DEFAULT_GRID_H = 32
 MIN_CELL_PX = 8
 MAX_CELL_PX = 48
 DEFAULT_CELL_PX = 16
+MAX_UNDO = 50
 
 
 def hex_to_rgb(h: str) -> Tuple[int, int, int]:
@@ -220,7 +221,7 @@ def hsv_to_rgb(h: float, s: float, v: float) -> Tuple[int, int, int]:
 
 def resize_palette(palette: List[str], n: int) -> List[str]:
     """Grow/shrink palette. New slots default to white. Index 0 stays black/transparent."""
-    n = max(2, min(64, n))
+    n = max(2, min(256, n))
     out = list(palette[:n])
     while len(out) < n:
         out.append("#ffffff")
@@ -329,8 +330,118 @@ def make_hsv_wheel(size: int = 200, value: float = 1.0) -> Image.Image:
     return img
 
 
+def empty_grid(w: int, h: int) -> List[List[int]]:
+    return [[0 for _ in range(w)] for _ in range(h)]
+
+
+def copy_grid(pixels: List[List[int]]) -> List[List[int]]:
+    return [row[:] for row in pixels]
+
+
+def snapshot_document(doc: "PixelDocument") -> dict:
+    """Deep snapshot for undo (layers + palette + size)."""
+    return {
+        "width": doc.width,
+        "height": doc.height,
+        "palette": list(doc.palette),
+        "active": doc.active,
+        "layers": [
+            {
+                "name": ly.name,
+                "visible": ly.visible,
+                "pixels": copy_grid(ly.pixels),
+            }
+            for ly in doc.layers
+        ],
+    }
+
+
+def restore_document(doc: "PixelDocument", snap: dict) -> None:
+    """Restore document fields from a snapshot (in place)."""
+    doc.width = int(snap["width"])
+    doc.height = int(snap["height"])
+    doc.palette = list(snap["palette"])
+    doc.layers = []
+    for ld in snap["layers"]:
+        doc.layers.append(
+            Layer(
+                str(ld["name"]),
+                doc.width,
+                doc.height,
+                copy_grid(ld["pixels"]),
+                bool(ld.get("visible", True)),
+            )
+        )
+    if not doc.layers:
+        doc.layers = [Layer("Frame 1", doc.width, doc.height)]
+    doc.active = int(snap.get("active", 0))
+    doc.ensure_active()
+    doc.dirty = True
+
+
+def palette_index_to_rgba(
+    palette: List[str], idx: int, transparent_zero: bool = True
+) -> Tuple[int, int, int, int]:
+    """Single place for index → RGBA (export / preview / canvas)."""
+    if transparent_zero and idx == 0:
+        return (0, 0, 0, 0)
+    idx = max(0, min(idx, len(palette) - 1))
+    r, g, b = hex_to_rgb(palette[idx])
+    return (r, g, b, 255)
+
+
+def render_grid_rgba(
+    width: int,
+    height: int,
+    palette: List[str],
+    index_at,
+    scale: int = 1,
+    transparent_zero: bool = True,
+) -> Image.Image:
+    """Shared nearest-neighbor RGBA render for PNG / preview / export paths."""
+    scale = max(1, min(64, int(scale)))
+    img = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
+    px = img.load()
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = palette_index_to_rgba(
+                palette, int(index_at(x, y)), transparent_zero
+            )
+            if a == 0:
+                continue
+            for dy in range(scale):
+                for dx in range(scale):
+                    px[x * scale + dx, y * scale + dy] = (r, g, b, a)
+    return img
+
+
+class Layer:
+    """One frame / angle / clone — palette indices, same size as document."""
+
+    __slots__ = ("name", "pixels", "visible")
+
+    def __init__(
+        self,
+        name: str,
+        width: int,
+        height: int,
+        pixels: Optional[List[List[int]]] = None,
+        visible: bool = True,
+    ):
+        self.name = name
+        self.pixels = pixels if pixels is not None else empty_grid(width, height)
+        self.visible = visible
+
+    def clone(self, new_name: str) -> "Layer":
+        return Layer(new_name, 0, 0, copy_grid(self.pixels), self.visible)
+
+
 class PixelDocument:
-    """In-memory image: grid of palette indices + palette hex colors."""
+    """
+    Palette + layers (frames / angles / clones).
+    Drawing hits the active layer. View/export composites visible layers
+    bottom→top (index 0 = transparent).
+    """
 
     def __init__(
         self,
@@ -341,23 +452,91 @@ class PixelDocument:
         self.width = max(1, min(256, width))
         self.height = max(1, min(256, height))
         self.palette = list(palette or DEFAULT_PALETTE)
-        # 0 = transparent (index 0 treated as clear for export if flag set)
-        self.pixels: List[List[int]] = [
-            [0 for _ in range(self.width)] for _ in range(self.height)
-        ]
+        self.layers: List[Layer] = [Layer("Frame 1", self.width, self.height)]
+        self.active = 0
         self.path: Optional[str] = None
         self.dirty = False
+
+    @property
+    def pixels(self) -> List[List[int]]:
+        return self.layers[self.active].pixels
+
+    @pixels.setter
+    def pixels(self, value: List[List[int]]) -> None:
+        self.layers[self.active].pixels = value
+
+    def composite_index(self, x: int, y: int) -> int:
+        for layer in reversed(self.layers):
+            if not layer.visible:
+                continue
+            if 0 <= y < len(layer.pixels) and 0 <= x < len(layer.pixels[y]):
+                idx = layer.pixels[y][x]
+                if idx != 0:
+                    return idx
+        return 0
+
+    def ensure_active(self) -> None:
+        if not self.layers:
+            self.layers = [Layer("Frame 1", self.width, self.height)]
+        self.active = max(0, min(self.active, len(self.layers) - 1))
+
+    def add_layer(self, name: Optional[str] = None, clone_active: bool = False) -> None:
+        self.ensure_active()
+        n = len(self.layers) + 1
+        if clone_active:
+            src = self.layers[self.active]
+            layer = src.clone(name or f"Clone of {src.name}")
+        else:
+            layer = Layer(name or f"Frame {n}", self.width, self.height)
+        self.layers.insert(self.active + 1, layer)
+        self.active += 1
+        self.dirty = True
+
+    def delete_active_layer(self) -> bool:
+        if len(self.layers) <= 1:
+            return False
+        del self.layers[self.active]
+        self.active = min(self.active, len(self.layers) - 1)
+        self.dirty = True
+        return True
+
+    def move_active_layer(self, delta: int) -> None:
+        j = self.active + delta
+        if j < 0 or j >= len(self.layers):
+            return
+        self.layers[self.active], self.layers[j] = self.layers[j], self.layers[self.active]
+        self.active = j
+        self.dirty = True
 
     def resize(self, w: int, h: int, keep: bool = True) -> None:
         w = max(1, min(256, w))
         h = max(1, min(256, h))
-        new_px = [[0 for _ in range(w)] for _ in range(h)]
-        if keep:
-            for y in range(min(h, self.height)):
-                for x in range(min(w, self.width)):
-                    new_px[y][x] = self.pixels[y][x]
+        for layer in self.layers:
+            new_px = empty_grid(w, h)
+            if keep:
+                for y in range(min(h, self.height)):
+                    for x in range(min(w, self.width)):
+                        new_px[y][x] = layer.pixels[y][x]
+            layer.pixels = new_px
         self.width, self.height = w, h
-        self.pixels = new_px
+        self.dirty = True
+
+    def scale_nearest(self, w: int, h: int) -> None:
+        w = max(1, min(256, w))
+        h = max(1, min(256, h))
+        if w == self.width and h == self.height:
+            return
+        old_w, old_h = self.width, self.height
+        for layer in self.layers:
+            old = layer.pixels
+            new_px = empty_grid(w, h)
+            for y in range(h):
+                sy = min(old_h - 1, (y * old_h) // h)
+                for x in range(w):
+                    sx = min(old_w - 1, (x * old_w) // w)
+                    new_px[y][x] = old[sy][sx]
+            layer.pixels = new_px
+        self.width, self.height = w, h
         self.dirty = True
 
     def set_pixel(self, x: int, y: int, idx: int) -> bool:
@@ -397,20 +576,44 @@ class PixelDocument:
     def to_dict(self) -> dict:
         return {
             "format": "ppix",
-            "version": 1,
+            "version": 2,
             "width": self.width,
             "height": self.height,
             "palette": self.palette,
+            "active": self.active,
+            "layers": [
+                {"name": ly.name, "visible": ly.visible, "pixels": ly.pixels}
+                for ly in self.layers
+            ],
             "pixels": self.pixels,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "PixelDocument":
         doc = cls(data["width"], data["height"], data.get("palette"))
-        doc.pixels = data["pixels"]
-        # validate
-        if len(doc.pixels) != doc.height or any(len(r) != doc.width for r in doc.pixels):
-            raise ValueError("Corrupt pixel grid")
+        layers_data = data.get("layers")
+        if isinstance(layers_data, list) and layers_data:
+            doc.layers = []
+            for i, ld in enumerate(layers_data):
+                if not isinstance(ld, dict):
+                    continue
+                px = ld.get("pixels") or empty_grid(doc.width, doc.height)
+                name = str(ld.get("name") or f"Frame {i + 1}")
+                vis = bool(ld.get("visible", True))
+                doc.layers.append(Layer(name, doc.width, doc.height, px, vis))
+            if not doc.layers:
+                doc.layers = [Layer("Frame 1", doc.width, doc.height)]
+            doc.active = int(data.get("active", 0))
+            doc.ensure_active()
+        else:
+            px = data.get("pixels")
+            if px is None:
+                raise ValueError("Missing pixels")
+            doc.layers = [Layer("Frame 1", doc.width, doc.height, px)]
+            doc.active = 0
+        for ly in doc.layers:
+            if len(ly.pixels) != doc.height or any(len(r) != doc.width for r in ly.pixels):
+                raise ValueError("Corrupt pixel grid in layer")
         return doc
 
     def save_ppix(self, path: str) -> None:
@@ -431,28 +634,21 @@ class PixelDocument:
         return doc
 
     def export_png(self, path: str, scale: int = 1, transparent_zero: bool = True) -> None:
-        """Lossless PNG — pixel-perfect when scale is integer."""
-        scale = max(1, min(64, scale))
-        img = Image.new("RGBA", (self.width * scale, self.height * scale), (0, 0, 0, 0))
-        px = img.load()
-        for y in range(self.height):
-            for x in range(self.width):
-                idx = self.pixels[y][x]
-                if transparent_zero and idx == 0:
-                    continue
-                idx = max(0, min(idx, len(self.palette) - 1))
-                r, g, b = hex_to_rgb(self.palette[idx])
-                for dy in range(scale):
-                    for dx in range(scale):
-                        px[x * scale + dx, y * scale + dy] = (r, g, b, 255)
+        img = render_grid_rgba(
+            self.width,
+            self.height,
+            self.palette,
+            self.composite_index,
+            scale=scale,
+            transparent_zero=transparent_zero,
+        )
         img.save(path, "PNG")
         add_recent(path)
 
     def export_c_rgb565(self, path: str, array_name: str = "sprite") -> None:
-        """C header for embedded (ESP32 / M5GFX) — RGB565, 0x0000 = transparent if index 0."""
         lines = [
             f"// Auto-generated by {APP_NAME} ({APP_AUTHOR})",
-            f"// {self.width}x{self.height} RGB565",
+            f"// {self.width}x{self.height} RGB565 (composited layers)",
             f"#pragma once",
             f"#include <stdint.h>",
             f"static const int {array_name}_w = {self.width};",
@@ -463,13 +659,11 @@ class PixelDocument:
         for y in range(self.height):
             row = []
             for x in range(self.width):
-                idx = self.pixels[y][x]
+                idx = self.composite_index(x, y)
                 if idx == 0:
                     row.append("0x0000")
                 else:
-                    idx = max(0, min(idx, len(self.palette) - 1))
-                    r, g, b = hex_to_rgb(self.palette[idx])
-                    # RGB565
+                    r, g, b, _a = palette_index_to_rgba(self.palette, idx, False)
                     c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
                     row.append(f"0x{c:04X}")
             vals.append("  " + ", ".join(row) + ",")
@@ -482,9 +676,18 @@ class PixelPainterApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.minsize(800, 600)
-        self.root.geometry("1024x720")
+        self.root.minsize(720, 480)
         self.root.configure(bg=Theme.BG)
+        # Start maximized (full desktop work area; still has title bar)
+        try:
+            self.root.state("zoomed")
+        except tk.TclError:
+            try:
+                self.root.attributes("-zoomed", True)
+            except tk.TclError:
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                self.root.geometry(f"{sw}x{sh}+0+0")
 
         self.doc = PixelDocument(DEFAULT_GRID_W, DEFAULT_GRID_H, list(DEFAULT_PALETTE))
         self.color_idx = 1
@@ -504,11 +707,16 @@ class PixelPainterApp:
         self._alt_held = False
         self._panning = False
         self._last_cell: Optional[Tuple[int, int]] = None
-        self._photo: Optional[ImageTk.PhotoImage] = None
+        self._photo: Optional[ImageTk.PhotoImage] = None  # 1:1 side preview
+        self._canvas_photo: Optional[ImageTk.PhotoImage] = None  # main view bitmap
         self._wheel_photo: Optional[ImageTk.PhotoImage] = None
         self._rebuild_ui_lock = False
         self._screen_pick_overlay: Optional[tk.Toplevel] = None
         self._screen_pick_target = "palette"
+        # Display cache: avoid thousands of canvas rectangles + full layer walks
+        self._comp_cache: Optional[List[List[int]]] = None
+        self._redraw_job: Optional[str] = None
+        self._redraw_preview = True
 
         # Selection / floating move
         # sel_cells: set of (x,y) on the grid that are selected
@@ -522,6 +730,11 @@ class PixelPainterApp:
         self.float_ox = 0  # world grid origin of float (can be off-canvas)
         self.float_oy = 0
         self._move_drag_last: Optional[Tuple[int, int]] = None
+
+        # Undo / redo (max MAX_UNDO steps)
+        self._undo_stack: List[dict] = []
+        self._redo_stack: List[dict] = []
+        self._hist_coalesce = False  # True while a multi-pixel stroke is open
 
         self._build_menu()
         self._build_ui()
@@ -568,6 +781,82 @@ class PixelPainterApp:
             **kw,
         )
 
+    # ----- undo / redo -----
+    def _hist_clear(self) -> None:
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._hist_coalesce = False
+        self._invalidate_composite()
+
+    def _hist_push(self) -> None:
+        """Save current document state before a mutating action."""
+        self._undo_stack.append(snapshot_document(self.doc))
+        while len(self._undo_stack) > MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _hist_push_once(self) -> None:
+        """Push at most once until _hist_end_stroke (for paint strokes)."""
+        if self._hist_coalesce:
+            return
+        self._hist_push()
+        self._hist_coalesce = True
+
+    def _hist_end_stroke(self) -> None:
+        self._hist_coalesce = False
+
+    def cmd_undo(self) -> None:
+        if not self._undo_stack:
+            self.status.configure(text="Nothing to undo")
+            return
+        self._hist_end_stroke()
+        self._redo_stack.append(snapshot_document(self.doc))
+        while len(self._redo_stack) > MAX_UNDO:
+            self._redo_stack.pop(0)
+        snap = self._undo_stack.pop()
+        restore_document(self.doc, snap)
+        self.sel_cells = set()
+        self.float_items = []
+        self.moving = False
+        self._invalidate_composite()
+        self.color_idx = min(self.color_idx, max(0, len(self.doc.palette) - 1))
+        if self.color_idx == 0 and len(self.doc.palette) > 1:
+            self.color_idx = 1
+        self.palette_count.set(len(self.doc.palette))
+        self._rebuild_palette_swatches()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+        self._refresh_title()
+        self.status.configure(
+            text=f"Undo  ·  {len(self._undo_stack)} left  ·  redo {len(self._redo_stack)}"
+        )
+
+    def cmd_redo(self) -> None:
+        if not self._redo_stack:
+            self.status.configure(text="Nothing to redo")
+            return
+        self._hist_end_stroke()
+        self._undo_stack.append(snapshot_document(self.doc))
+        while len(self._undo_stack) > MAX_UNDO:
+            self._undo_stack.pop(0)
+        snap = self._redo_stack.pop()
+        restore_document(self.doc, snap)
+        self.sel_cells = set()
+        self.float_items = []
+        self.moving = False
+        self._invalidate_composite()
+        self.color_idx = min(self.color_idx, max(0, len(self.doc.palette) - 1))
+        if self.color_idx == 0 and len(self.doc.palette) > 1:
+            self.color_idx = 1
+        self.palette_count.set(len(self.doc.palette))
+        self._rebuild_palette_swatches()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+        self._refresh_title()
+        self.status.configure(
+            text=f"Redo  ·  undo {len(self._undo_stack)}  ·  redo left {len(self._redo_stack)}"
+        )
+
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root, bg=Theme.BG_PANEL, fg=Theme.FG, tearoff=0,
                           activebackground=Theme.GREEN_DK, activeforeground=Theme.FG)
@@ -595,6 +884,9 @@ class PixelPainterApp:
         edit_m.add_command(label="Clear canvas", command=self.cmd_clear)
         edit_m.add_separator()
         edit_m.add_command(label="Edit color (wheel)…", command=self.cmd_edit_color, accelerator="C")
+        edit_m.add_command(label="Undo", command=self.cmd_undo, accelerator="Ctrl+Z")
+        edit_m.add_command(label="Redo", command=self.cmd_redo, accelerator="Ctrl+Shift+Z")
+        edit_m.add_separator()
         edit_m.add_command(label="Replace drawn color…", command=self.cmd_replace_color)
         edit_m.add_command(label="Set palette size…", command=self.cmd_set_palette_size)
         edit_m.add_command(label="Screen pick → palette", command=self.cmd_screen_pick, accelerator="P")
@@ -735,7 +1027,7 @@ class PixelPainterApp:
         self.size_spin = tk.Spinbox(
             size_row,
             from_=2,
-            to=64,
+            to=256,
             width=4,
             textvariable=self.palette_count,
             command=self._on_palette_count_spin,
@@ -861,10 +1153,75 @@ class PixelPainterApp:
         self.canvas.bind("<Control-Button-4>", lambda e: self._zoom_by(2))
         self.canvas.bind("<Control-Button-5>", lambda e: self._zoom_by(-2))
 
-        # Right info
-        right = tk.Frame(body, bg=Theme.BG_PANEL, width=160)
-        right.pack(side=tk.RIGHT, fill=tk.Y)
-        right.pack_propagate(False)
+        # Right panel — scrollable so layers/buttons stay reachable in short windows
+        right_shell = tk.Frame(body, bg=Theme.BG_PANEL, width=220)
+        right_shell.pack(side=tk.RIGHT, fill=tk.Y)
+        right_shell.pack_propagate(False)
+
+        right_sb = tk.Scrollbar(
+            right_shell,
+            orient=tk.VERTICAL,
+            bg=Theme.BG_PANEL,
+            troughcolor=Theme.BG,
+            activebackground=Theme.GREEN_DK,
+        )
+        right_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.right_canvas = tk.Canvas(
+            right_shell,
+            bg=Theme.BG_PANEL,
+            highlightthickness=0,
+            bd=0,
+            width=200,
+            yscrollcommand=right_sb.set,
+        )
+        self.right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_sb.configure(command=self.right_canvas.yview)
+
+        right = tk.Frame(self.right_canvas, bg=Theme.BG_PANEL)
+        self._right_window = self.right_canvas.create_window(
+            (0, 0), window=right, anchor=tk.NW
+        )
+
+        def _right_inner_cfg(_event=None) -> None:
+            self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all"))
+
+        def _right_canvas_cfg(event) -> None:
+            # Stretch inner frame to canvas width
+            self.right_canvas.itemconfigure(self._right_window, width=max(1, event.width))
+
+        right.bind("<Configure>", _right_inner_cfg)
+        self.right_canvas.bind("<Configure>", _right_canvas_cfg)
+
+        def _right_wheel(event) -> str:
+            # Windows / Mac: event.delta; only when pointer is over the side panel
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta:
+                self.right_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+            return "break"
+
+        def _right_wheel_linux(event) -> str:
+            if getattr(event, "num", 0) == 4:
+                self.right_canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", 0) == 5:
+                self.right_canvas.yview_scroll(3, "units")
+            return "break"
+
+        def _bind_right_wheel(_event=None) -> None:
+            self.right_canvas.bind_all("<MouseWheel>", _right_wheel)
+            self.right_canvas.bind_all("<Button-4>", _right_wheel_linux)
+            self.right_canvas.bind_all("<Button-5>", _right_wheel_linux)
+
+        def _unbind_right_wheel(_event=None) -> None:
+            self.right_canvas.unbind_all("<MouseWheel>")
+            self.right_canvas.unbind_all("<Button-4>")
+            self.right_canvas.unbind_all("<Button-5>")
+            # Keep Ctrl+wheel zoom on main canvas
+            self.canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
+
+        for w in (right_shell, self.right_canvas, right):
+            w.bind("<Enter>", _bind_right_wheel)
+            w.bind("<Leave>", _unbind_right_wheel)
+
         self._label(right, "DOCUMENT", font=("Segoe UI", 9, "bold")).pack(pady=(10, 6))
         self.info = self._label(right, "", justify=tk.LEFT, fg=Theme.FG_DIM)
         self.info.pack(anchor=tk.W, padx=10)
@@ -881,16 +1238,74 @@ class PixelPainterApp:
             self._style_btn(b)
             b.pack(fill=tk.X, padx=10, pady=3)
 
+        self._label(right, "LAYERS / FRAMES", font=("Segoe UI", 9, "bold")).pack(
+            pady=(14, 4)
+        )
+        self._label(
+            right,
+            "Clone for animation frames\nor side/angle views.\n"
+            "Paint hits active only.\n"
+            "View = all visible stacked.\n"
+            "Scroll this panel if short.",
+            fg=Theme.FG_DIM,
+            justify=tk.LEFT,
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, padx=10, pady=(0, 4))
+
+        self.layer_list = tk.Listbox(
+            right,
+            height=8,
+            bg=Theme.BG_INPUT,
+            fg=Theme.FG,
+            selectbackground=Theme.GREEN_DK,
+            selectforeground=Theme.FG,
+            highlightthickness=1,
+            highlightbackground=Theme.BORDER,
+            activestyle="none",
+            font=("Segoe UI", 9),
+            exportselection=False,
+        )
+        self.layer_list.pack(fill=tk.X, padx=10, pady=2)
+        self.layer_list.bind("<<ListboxSelect>>", self._on_layer_select)
+        self.layer_list.bind("<Double-Button-1>", lambda e: self.cmd_rename_layer())
+
+        lr = tk.Frame(right, bg=Theme.BG_PANEL)
+        lr.pack(fill=tk.X, padx=10, pady=2)
+        for text, cmd in [
+            ("+ New", self.cmd_layer_new),
+            ("Clone", self.cmd_layer_clone),
+        ]:
+            b = tk.Button(lr, text=text, command=cmd)
+            self._style_btn(b)
+            b.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        lr2 = tk.Frame(right, bg=Theme.BG_PANEL)
+        lr2.pack(fill=tk.X, padx=10, pady=2)
+        for text, cmd in [
+            ("▲", lambda: self.cmd_layer_move(1)),
+            ("▼", lambda: self.cmd_layer_move(-1)),
+            ("👁", self.cmd_layer_toggle_vis),
+            ("✕", self.cmd_layer_delete),
+        ]:
+            b = tk.Button(lr2, text=text, command=cmd, width=3)
+            self._style_btn(b)
+            b.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+        b_ren = tk.Button(right, text="Rename…", command=self.cmd_rename_layer)
+        self._style_btn(b_ren)
+        b_ren.pack(fill=tk.X, padx=10, pady=2)
+
         self.preview_label = self._label(right, "1:1 preview", fg=Theme.FG_DIM)
-        self.preview_label.pack(pady=(16, 4))
+        self.preview_label.pack(pady=(12, 4))
         self.preview_canvas = tk.Canvas(
             right, width=128, height=128, bg=Theme.CANVAS_BG, highlightthickness=1,
             highlightbackground=Theme.BORDER,
         )
-        self.preview_canvas.pack(padx=10)
+        self.preview_canvas.pack(padx=10, pady=(0, 16))
 
         self._rebuild_palette_swatches()
+        self._rebuild_layer_list()
         self._update_info()
+        # Ensure scrollregion after first layout
+        self.root.after(100, _right_inner_cfg)
 
     def _bind_keys(self) -> None:
         r = self.root
@@ -900,6 +1315,12 @@ class PixelPainterApp:
         r.bind("<Control-I>", lambda e: self.cmd_pixelate_import())
         r.bind("<Control-s>", lambda e: self.cmd_save())
         r.bind("<Control-S>", lambda e: self.cmd_save_as())
+        r.bind("<Control-z>", lambda e: self.cmd_undo())
+        r.bind("<Control-Z>", lambda e: self.cmd_undo())
+        r.bind("<Control-Shift-z>", lambda e: self.cmd_redo())
+        r.bind("<Control-Shift-Z>", lambda e: self.cmd_redo())
+        r.bind("<Control-y>", lambda e: self.cmd_redo())  # common Windows redo
+        r.bind("<Control-Y>", lambda e: self.cmd_redo())
         r.bind("1", lambda e: self._set_brush(1))
         r.bind("2", lambda e: self._set_brush(2))
         r.bind("3", lambda e: self._set_brush(3))
@@ -1000,7 +1421,8 @@ class PixelPainterApp:
 
     def _on_view_toggle(self) -> None:
         self._persist_view_config()
-        self._redraw()
+        self._invalidate_composite()  # checker / empty fill may change
+        self._redraw(update_preview=True)
 
     def _set_canvas_bg(self, hex_color: str) -> None:
         try:
@@ -1021,6 +1443,7 @@ class PixelPainterApp:
             self._set_canvas_bg(hex_color)
         if target in ("palette", "both"):
             # Prefer replacing current swatch (if not index 0), else add
+            self._hist_push()
             if self.color_idx == 0 and len(self.doc.palette) > 1:
                 self.color_idx = 1
             if 0 <= self.color_idx < len(self.doc.palette):
@@ -1052,9 +1475,11 @@ class PixelPainterApp:
             n = int(self.palette_count.get())
         except Exception:
             return
-        n = max(2, min(64, n))
+        n = max(2, min(256, n))
         self.palette_count.set(n)
         old_len = len(self.doc.palette)
+        if n != old_len:
+            self._hist_push()
         self.doc.palette = resize_palette(self.doc.palette, n)
         if n != old_len:
             self.doc.dirty = True
@@ -1111,7 +1536,11 @@ class PixelPainterApp:
     def cmd_apply_preset(self, name: str) -> None:
         if name not in PALETTE_PRESETS:
             return
-        if self.doc.dirty or any(any(px != 0 for px in row) for row in self.doc.pixels):
+        if self.doc.dirty or any(
+            any(px != 0 for px in row)
+            for ly in self.doc.layers
+            for row in ly.pixels
+        ):
             if not messagebox.askyesno(
                 APP_NAME,
                 f"Replace palette with “{name}”?\n"
@@ -1123,7 +1552,8 @@ class PixelPainterApp:
         base = list(PALETTE_PRESETS[name])
         # Keep current slot count if larger
         n = max(len(base), int(self.palette_count.get()) if self.palette_count.get() else len(base))
-        n = max(2, min(64, n))
+        n = max(2, min(256, n))
+        self._hist_push()
         self.doc.palette = resize_palette(base, n)
         self.doc.dirty = True
         self.color_idx = min(self.color_idx, n - 1)
@@ -1136,11 +1566,11 @@ class PixelPainterApp:
     def cmd_set_palette_size(self) -> None:
         n = simpledialog.askinteger(
             "Palette size",
-            "Number of color slots (2–64).\n"
+            "Number of color slots (2–256).\n"
             "Existing colors kept; new slots = white.",
             initialvalue=len(self.doc.palette),
             minvalue=2,
-            maxvalue=64,
+            maxvalue=256,
             parent=self.root,
         )
         if n:
@@ -1236,6 +1666,7 @@ class PixelPainterApp:
         if not self.sel_cells:
             messagebox.showinfo(APP_NAME, "Select pixels first (Box or Free).", parent=self.root)
             return
+        self._hist_push()
         # Only lift non-empty pixels; keep transparent holes
         xs = [p[0] for p in self.sel_cells]
         ys = [p[1] for p in self.sel_cells]
@@ -1269,6 +1700,7 @@ class PixelPainterApp:
             self.moving = False
             self._update_move_btn()
             return
+        self._hist_push()
         # Stamp; anything outside grid is discarded
         for lx, ly, idx in self.float_items:
             wx = self.float_ox + lx
@@ -1325,6 +1757,13 @@ class PixelPainterApp:
             self.sel_cells.add(cell)
             self._redraw()
             return
+        # One history entry for whole stroke / fill
+        if t in ("paint", "erase", "fill") or self._effective_tool() in (
+            "paint",
+            "erase",
+            "fill",
+        ):
+            self._hist_push_once()
         self._stroke(cell[0], cell[1])
 
     def _on_drag(self, event) -> None:
@@ -1394,6 +1833,9 @@ class PixelPainterApp:
         self._paint_down = False
         self._last_cell = None
         self._move_drag_last = None
+        self._hist_end_stroke()
+        # Final paint of stroke includes 1:1 preview (skipped during drag for speed)
+        self._schedule_redraw(preview=True)
         self._refresh_title()
         self._update_move_btn()
 
@@ -1401,6 +1843,7 @@ class PixelPainterApp:
         # Right-click erase (if trackpad supports it)
         cell = self._event_to_cell(event)
         if cell:
+            self._hist_push_once()
             self._erase_stroke(cell[0], cell[1])
             self._last_cell = cell
             self._paint_down = True  # allow B3-Motion if available
@@ -1427,9 +1870,11 @@ class PixelPainterApp:
         else:
             self.status.configure(text=f"{self.doc.width}×{self.doc.height}  |  {et}{sp}")
 
-    def _erase_stroke(self, x: int, y: int) -> None:
+    def _erase_stroke(self, x: int, y: int, schedule: bool = True) -> None:
         self._apply_brush(x, y, 0)
-        self._redraw()
+        self._invalidate_composite()
+        if schedule:
+            self._schedule_redraw(preview=False)
 
     def _line_erase(self, x0: int, y0: int, x1: int, y1: int) -> None:
         dx = abs(x1 - x0)
@@ -1438,7 +1883,7 @@ class PixelPainterApp:
         sy = 1 if y0 < y1 else -1
         err = dx - dy
         while True:
-            self._erase_stroke(x0, y0)
+            self._erase_stroke(x0, y0, schedule=False)
             if x0 == x1 and y0 == y1:
                 break
             e2 = 2 * err
@@ -1448,21 +1893,26 @@ class PixelPainterApp:
             if e2 < dx:
                 err += dx
                 y0 += sy
+        self._schedule_redraw(preview=False)
 
-    def _stroke(self, x: int, y: int) -> None:
+    def _stroke(self, x: int, y: int, schedule: bool = True) -> None:
         tool = self._effective_tool()
         if tool == "eye":
             self.color_idx = self.doc.get_pixel(x, y)
             self._rebuild_palette_swatches()
             return
         if tool == "fill":
-            # Space+fill already maps to erase via _effective_tool
             self.doc.flood_fill(x, y, self.color_idx)
-            self._redraw()
+            self._invalidate_composite()
+            self._schedule_redraw(preview=True)
             return
         idx = 0 if tool == "erase" else self.color_idx
         self._apply_brush(x, y, idx)
-        self._redraw()
+        # Brush only dirties a small area — drop full composite cache for correctness
+        # (rebuild is cheap at ≤256²; avoid walking layers per canvas rect)
+        self._invalidate_composite()
+        if schedule:
+            self._schedule_redraw(preview=False)
 
     def _line_stroke(self, x0: int, y0: int, x1: int, y1: int) -> None:
         dx = abs(x1 - x0)
@@ -1471,7 +1921,7 @@ class PixelPainterApp:
         sy = 1 if y0 < y1 else -1
         err = dx - dy
         while True:
-            self._stroke(x0, y0)
+            self._stroke(x0, y0, schedule=False)
             if x0 == x1 and y0 == y1:
                 break
             e2 = 2 * err
@@ -1481,58 +1931,128 @@ class PixelPainterApp:
             if e2 < dx:
                 err += dx
                 y0 += sy
+        self._schedule_redraw(preview=False)
 
     def _on_resize(self, event) -> None:
         if event.widget is self.root:
-            self.root.after_idle(self._redraw)
+            self._schedule_redraw(preview=True)
 
-    def _redraw(self) -> None:
+    def _invalidate_composite(self) -> None:
+        self._comp_cache = None
+
+    def _ensure_composite_cache(self) -> None:
+        """Flat index grid for display — O(w*h*layers) once, not every canvas item."""
+        w, h = self.doc.width, self.doc.height
+        if (
+            self._comp_cache is not None
+            and len(self._comp_cache) == h
+            and (h == 0 or len(self._comp_cache[0]) == w)
+        ):
+            return
+        cache = empty_grid(w, h)
+        for y in range(h):
+            for x in range(w):
+                cache[y][x] = self.doc.composite_index(x, y)
+        self._comp_cache = cache
+
+    def _touch_composite_cells(self, cells) -> None:
+        """Refresh cache for a few cells after paint (cheap)."""
+        if self._comp_cache is None:
+            return
+        w, h = self.doc.width, self.doc.height
+        for x, y in cells:
+            if 0 <= x < w and 0 <= y < h:
+                self._comp_cache[y][x] = self.doc.composite_index(x, y)
+
+    def _schedule_redraw(self, preview: bool = True) -> None:
+        """Coalesce many paint events into one paint of the view."""
+        if preview:
+            self._redraw_preview = True
+        if self._redraw_job is not None:
+            return
+        self._redraw_job = self.root.after_idle(self._flush_redraw)
+
+    def _flush_redraw(self) -> None:
+        self._redraw_job = None
+        do_prev = self._redraw_preview
+        self._redraw_preview = False
+        self._redraw(update_preview=do_prev)
+
+    def _build_view_bitmap(self, cell: int) -> Image.Image:
+        """1× doc → RGB, then nearest scale by cell size (one PhotoImage for the canvas)."""
+        self._ensure_composite_cache()
+        assert self._comp_cache is not None
+        w, h = self.doc.width, self.doc.height
+        base = Image.new("RGB", (w, h))
+        px = base.load()
+        bg = hex_to_rgb(self.canvas_bg)
+        ca = hex_to_rgb(Theme.CHECKER_A)
+        cb = hex_to_rgb(Theme.CHECKER_B)
+        checker = self.use_checker.get()
+        pal = self.doc.palette
+        n_pal = len(pal)
+        for y in range(h):
+            row = self._comp_cache[y]
+            for x in range(w):
+                idx = row[x]
+                if idx == 0:
+                    px[x, y] = ca if (checker and (x + y) % 2 == 0) else (
+                        cb if checker else bg
+                    )
+                else:
+                    if idx >= n_pal:
+                        idx = n_pal - 1
+                    px[x, y] = hex_to_rgb(pal[idx])
+        if cell <= 1:
+            return base
+        return base.resize((w * cell, h * cell), Image.Resampling.NEAREST)
+
+    def _redraw(self, update_preview: bool = True) -> None:
         if self._rebuild_ui_lock:
             return
-        self.canvas.delete("all")
         ox, oy, cell, _ = self._layout_metrics()
         w, h = self.doc.width, self.doc.height
         total_w = ox * 2 + w * cell
         total_h = oy * 2 + h * cell
         self.canvas.configure(scrollregion=(0, 0, total_w, total_h))
+        self.canvas.delete("all")
 
-        # Empty cells (index 0): solid canvas BG or checker — never confused with paint
-        for y in range(h):
-            for x in range(w):
-                px = ox + x * cell
-                py = oy + y * cell
-                idx = self.doc.pixels[y][x]
-                if idx == 0:
-                    if self.use_checker.get():
-                        c = Theme.CHECKER_A if (x + y) % 2 == 0 else Theme.CHECKER_B
-                    else:
-                        c = self.canvas_bg
-                else:
-                    idx = max(0, min(idx, len(self.doc.palette) - 1))
-                    c = self.doc.palette[idx]
-                self.canvas.create_rectangle(
-                    px, py, px + cell, py + cell, fill=c, outline="", width=0
-                )
+        # Single bitmap instead of w*h create_rectangle calls
+        try:
+            view = self._build_view_bitmap(cell)
+            self._canvas_photo = ImageTk.PhotoImage(view)
+            self.canvas.create_image(
+                ox, oy, image=self._canvas_photo, anchor=tk.NW, tags=("bmp",)
+            )
+        except Exception:
+            # Fallback: solid bg
+            self.canvas.create_rectangle(
+                ox, oy, ox + w * cell, oy + h * cell, fill=self.canvas_bg, outline=""
+            )
 
         if self.show_grid.get() and cell >= 4:
             for x in range(w + 1):
                 X = ox + x * cell
-                self.canvas.create_line(X, oy, X, oy + h * cell, fill=Theme.GRID_LINE)
+                self.canvas.create_line(
+                    X, oy, X, oy + h * cell, fill=Theme.GRID_LINE, tags=("grid",)
+                )
             for y in range(h + 1):
                 Y = oy + y * cell
-                self.canvas.create_line(ox, Y, ox + w * cell, Y, fill=Theme.GRID_LINE)
+                self.canvas.create_line(
+                    ox, Y, ox + w * cell, Y, fill=Theme.GRID_LINE, tags=("grid",)
+                )
 
-        # Selection overlay (marching-ish green outline)
+        # Selection overlay
         if self.sel_cells and not self.moving:
+            lw = max(1, cell // 8)
             for sx, sy in self.sel_cells:
                 px = ox + sx * cell
                 py = oy + sy * cell
                 self.canvas.create_rectangle(
                     px, py, px + cell, py + cell,
-                    outline=Theme.GREEN, width=max(1, cell // 8),
+                    outline=Theme.GREEN, width=lw, tags=("sel",),
                 )
 
-        # Rubber-band box while dragging
         if self._sel_box_start and self._sel_box_end:
             x0, y0 = self._sel_box_start
             x1, y1 = self._sel_box_end
@@ -1543,10 +2063,9 @@ class PixelPainterApp:
             self.canvas.create_rectangle(
                 ox + x0 * cell, oy + y0 * cell,
                 ox + (x1 + 1) * cell, oy + (y1 + 1) * cell,
-                outline=Theme.GREEN, width=2, dash=(4, 2),
+                outline=Theme.GREEN, width=2, dash=(4, 2), tags=("sel",),
             )
 
-        # Floating selection (can be off-grid)
         if self.moving and self.float_items:
             for lx, ly, idx in self.float_items:
                 wx = self.float_ox + lx
@@ -1557,35 +2076,35 @@ class PixelPainterApp:
                 c = self.doc.palette[idx]
                 self.canvas.create_rectangle(
                     px, py, px + cell, py + cell,
-                    fill=c, outline=Theme.GREEN, width=1,
+                    fill=c, outline=Theme.GREEN, width=1, tags=("float",),
                 )
 
-        # outer border
         self.canvas.create_rectangle(
             ox, oy, ox + w * cell, oy + h * cell,
-            outline=Theme.GREEN_DK, width=2,
+            outline=Theme.GREEN_DK, width=2, tags=("border",),
         )
 
-        self._draw_preview()
+        if update_preview:
+            self._draw_preview()
         self._update_info()
         self._update_move_btn()
 
     def _draw_preview(self) -> None:
         self.preview_canvas.delete("all")
         scale = max(1, min(128 // max(1, self.doc.width), 128 // max(1, self.doc.height)))
-        img = Image.new("RGBA", (self.doc.width * scale, self.doc.height * scale), (0, 0, 0, 0))
-        px = img.load()
-        for y in range(self.doc.height):
-            for x in range(self.doc.width):
-                idx = self.doc.pixels[y][x]
-                if idx == 0:
-                    continue
-                idx = max(0, min(idx, len(self.doc.palette) - 1))
-                r, g, b = hex_to_rgb(self.doc.palette[idx])
-                for dy in range(scale):
-                    for dx in range(scale):
-                        px[x * scale + dx, y * scale + dy] = (r, g, b, 255)
-        # center in 128 box
+        self._ensure_composite_cache()
+
+        def idx_at(x: int, y: int) -> int:
+            assert self._comp_cache is not None
+            return self._comp_cache[y][x]
+
+        img = render_grid_rgba(
+            self.doc.width,
+            self.doc.height,
+            self.doc.palette,
+            idx_at,
+            scale=scale,
+        )
         self._photo = ImageTk.PhotoImage(img)
         self.preview_canvas.create_image(64, 64, image=self._photo)
 
@@ -1593,11 +2112,14 @@ class PixelPainterApp:
         p = self.doc.path or "(unsaved)"
         et = self._effective_tool()
         sp = " +Space" if self._space_held else ""
+        ly = self.doc.layers[self.doc.active].name if self.doc.layers else "?"
         self.info.configure(
             text=(
                 f"{self.doc.width} × {self.doc.height}\n"
                 f"zoom: {self.cell_px}px/cell\n"
                 f"palette: {len(self.doc.palette)} slots\n"
+                f"layers: {len(self.doc.layers)}\n"
+                f"active: {ly}\n"
                 f"brush: {self.brush}×{self.brush}\n"
                 f"tool: {et}{sp}\n"
                 f"{'modified' if self.doc.dirty else 'clean'}\n\n"
@@ -1637,29 +2159,51 @@ class PixelPainterApp:
             return
         self.doc = PixelDocument(w, h, list(DEFAULT_PALETTE))
         self.color_idx = 1
+        self._hist_clear()
         self._rebuild_palette_swatches()
+        self._rebuild_layer_list()
         self._refresh_title()
         self._redraw()
 
     def cmd_resize(self) -> None:
         w = simpledialog.askinteger(
-            "Resize", "New width:", initialvalue=self.doc.width,
+            "Resize / scale", "New width:", initialvalue=self.doc.width,
             minvalue=1, maxvalue=256, parent=self.root,
         )
         if not w:
             return
         h = simpledialog.askinteger(
-            "Resize", "New height:", initialvalue=self.doc.height,
+            "Resize / scale", "New height:", initialvalue=self.doc.height,
             minvalue=1, maxvalue=256, parent=self.root,
         )
         if not h:
             return
-        self.doc.resize(w, h, keep=True)
+        # Default = scale the art (what people expect). Crop/pad is optional.
+        scale = messagebox.askyesno(
+            APP_NAME,
+            "Scale the image to the new size? (nearest-neighbor)\n\n"
+            "Yes = stretch/shrink the whole picture\n"
+            "No  = only change canvas (crop or pad, top-left stays)",
+            parent=self.root,
+        )
+        self._hist_push()
+        if scale:
+            self.doc.scale_nearest(w, h)
+        else:
+            self.doc.resize(w, h, keep=True)
+        self.sel_cells = set()
+        self.float_items = []
+        self.moving = False
         self._refresh_title()
         self._redraw()
 
     def cmd_clear(self) -> None:
-        if messagebox.askyesno(APP_NAME, "Clear all pixels?", parent=self.root):
+        if messagebox.askyesno(
+            APP_NAME,
+            "Clear the active layer?",
+            parent=self.root,
+        ):
+            self._hist_push()
             for y in range(self.doc.height):
                 for x in range(self.doc.width):
                     self.doc.pixels[y][x] = 0
@@ -1667,16 +2211,113 @@ class PixelPainterApp:
             self._redraw()
             self._refresh_title()
 
+    # ----- layers / frames -----
+    def _rebuild_layer_list(self) -> None:
+        if not hasattr(self, "layer_list"):
+            return
+        self.layer_list.delete(0, tk.END)
+        # Show top layer first (like most editors)
+        for i in range(len(self.doc.layers) - 1, -1, -1):
+            ly = self.doc.layers[i]
+            eye = "●" if ly.visible else "○"
+            mark = "▶ " if i == self.doc.active else "  "
+            self.layer_list.insert(tk.END, f"{mark}{eye} {ly.name}")
+        # Select active in listbox (inverted index)
+        ui = len(self.doc.layers) - 1 - self.doc.active
+        if 0 <= ui < self.layer_list.size():
+            self.layer_list.selection_clear(0, tk.END)
+            self.layer_list.selection_set(ui)
+            self.layer_list.see(ui)
+
+    def _on_layer_select(self, _evt=None) -> None:
+        sel = self.layer_list.curselection()
+        if not sel:
+            return
+        ui = int(sel[0])
+        idx = len(self.doc.layers) - 1 - ui
+        if idx == self.doc.active:
+            return
+        self.doc.active = max(0, min(idx, len(self.doc.layers) - 1))
+        self._rebuild_layer_list()
+        self._redraw()
+
+    def cmd_layer_new(self) -> None:
+        self._hist_push()
+        self.doc.add_layer(clone_active=False)
+        self._invalidate_composite()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+        self._refresh_title()
+
+    def cmd_layer_clone(self) -> None:
+        self._hist_push()
+        self.doc.add_layer(clone_active=True)
+        self._invalidate_composite()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+        self._refresh_title()
+
+    def cmd_layer_delete(self) -> None:
+        if len(self.doc.layers) <= 1:
+            messagebox.showinfo(APP_NAME, "Need at least one layer.", parent=self.root)
+            return
+        name = self.doc.layers[self.doc.active].name
+        if not messagebox.askyesno(APP_NAME, f"Delete layer “{name}”?", parent=self.root):
+            return
+        self._hist_push()
+        self.doc.delete_active_layer()
+        self._invalidate_composite()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+        self._refresh_title()
+
+    def cmd_layer_move(self, delta: int) -> None:
+        # UI ▲ = higher in stack = +1 index in list (top of stack)
+        self._hist_push()
+        self.doc.move_active_layer(delta)
+        self._invalidate_composite()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+
+    def cmd_layer_toggle_vis(self) -> None:
+        self._hist_push()
+        ly = self.doc.layers[self.doc.active]
+        ly.visible = not ly.visible
+        self.doc.dirty = True
+        self._invalidate_composite()
+        self._rebuild_layer_list()
+        self._redraw(update_preview=True)
+        self._refresh_title()
+
+    def cmd_rename_layer(self) -> None:
+        ly = self.doc.layers[self.doc.active]
+        name = simpledialog.askstring(
+            "Rename layer",
+            "Name (e.g. walk_01, side, front):",
+            initialvalue=ly.name,
+            parent=self.root,
+        )
+        if name and name.strip():
+            self._hist_push()
+            ly.name = name.strip()
+            self.doc.dirty = True
+            self._rebuild_layer_list()
+            self._update_info()
+            self._refresh_title()
+
     def cmd_open(self) -> None:
         if not self._confirm_discard():
             return
         path = filedialog.askopenfilename(
             parent=self.root,
-            title="Open project",
+            title="Open project or image",
             filetypes=[
-                ("Pixel Painter", "*.ppix"),
-                ("PNG image", "*.png"),
-                ("All", "*.*"),
+                ("Images & projects", "*.ppix;*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp"),
+                ("PixelPainter project", "*.ppix"),
+                ("PNG", "*.png"),
+                ("JPEG", "*.jpg;*.jpeg"),
+                ("BMP", "*.bmp"),
+                ("All files", "*.*"),
             ],
         )
         if path:
@@ -1685,57 +2326,86 @@ class PixelPainterApp:
     def _open_path(self, path: str) -> None:
         try:
             p = Path(path)
-            if p.suffix.lower() == ".ppix":
+            suf = p.suffix.lower()
+            if suf == ".ppix":
                 self.doc = PixelDocument.load_ppix(path)
-            elif p.suffix.lower() == ".png":
-                self.doc = self._import_png(path)
+            elif suf in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"):
+                img = Image.open(path).convert("RGBA")
+                # Large photos → pixelate dialog (block size + grid align + colors)
+                if img.width > 256 or img.height > 256:
+                    messagebox.showinfo(
+                        APP_NAME,
+                        f"Image is {img.width}×{img.height}.\n"
+                        "Opening Import & pixelate so you can downscale,\n"
+                        "align the grid, and limit colors.",
+                        parent=self.root,
+                    )
+                    self._open_pixelate_dialog(img, path)
+                    return
+                self.doc = self._rgba_image_to_doc(img, max_colors=256, quantize=True)
+                self.doc.path = None
+                self.doc.dirty = True
+                add_recent(path)
             else:
-                messagebox.showerror(APP_NAME, "Open .ppix or .png", parent=self.root)
+                messagebox.showerror(
+                    APP_NAME,
+                    "Open a .ppix project or image (png/jpg/bmp/gif/webp).",
+                    parent=self.root,
+                )
                 return
             self.color_idx = min(1, len(self.doc.palette) - 1)
             self.palette_count.set(len(self.doc.palette))
+            self.sel_cells = set()
+            self.float_items = []
+            self.moving = False
+            self._hist_clear()
             self._rebuild_palette_swatches()
+            self._rebuild_layer_list()
             self._rebuild_recent_menu()
             self._refresh_title()
             self._redraw()
         except Exception as ex:
             messagebox.showerror(APP_NAME, f"Open failed:\n{ex}", parent=self.root)
 
-    def _import_png(self, path: str) -> PixelDocument:
-        img = Image.open(path).convert("RGBA")
-        w, h = img.size
-        if w > 256 or h > 256:
-            raise ValueError(
-                "PNG larger than 256×256 — use File → Import & pixelate… "
-                "to downscale with grid alignment first"
-            )
-        doc = self._rgba_image_to_doc(img)
-        doc.path = None
-        doc.dirty = True
-        add_recent(path)
-        return doc
-
     @staticmethod
     def _quantize_rgba(img: Image.Image, max_colors: int) -> Image.Image:
         """
-        Decimate colors with Pillow median-cut (no dither).
-        max_colors = opaque palette size (transparent kept separate).
+        Decimate colors without the black/purple corruption from hand-reading
+        adaptive P palettes. Always round-trip through quantize → RGB.
+        Transparent pixels stay transparent; they are not baked as black.
         """
         img = img.convert("RGBA")
         w, h = img.size
-        max_colors = max(2, min(256, int(max_colors)))
+        max_colors = max(1, min(256, int(max_colors)))
         src = img.load()
-        # RGB image for quantize; transparent pixels → magenta key then restored
-        rgb = Image.new("RGB", (w, h), (0, 0, 0))
+        alpha = img.split()[3]
+
+        # Unique opaque colors — skip if already within budget
+        opaque_keys: set = set()
+        over = False
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = src[x, y]
+                if a >= 128:
+                    opaque_keys.add((r & 0xFF, g & 0xFF, b & 0xFF))
+                    if len(opaque_keys) > max_colors:
+                        over = True
+                        break
+            if over:
+                break
+        if not over:
+            return img
+
+        # Composite opaque pixels only; leave transparent as mid-gray so black
+        # does not dominate the adaptive palette (common purple/black bug).
+        rgb = Image.new("RGB", (w, h), (128, 128, 128))
         rpx = rgb.load()
         for y in range(h):
             for x in range(w):
                 r, g, b, a = src[x, y]
-                if a < 128:
-                    rpx[x, y] = (0, 0, 0)
-                else:
+                if a >= 128:
                     rpx[x, y] = (r, g, b)
-        # Use up to max_colors opaque colors
+
         try:
             q = rgb.quantize(
                 colors=max_colors,
@@ -1743,33 +2413,48 @@ class PixelPainterApp:
                 dither=Image.Dither.NONE,
             )
         except Exception:
-            q = rgb.quantize(colors=max_colors, dither=Image.Dither.NONE)
-        qrgb = q.convert("RGB")
-        qpx = qrgb.load()
-        out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            try:
+                q = rgb.quantize(
+                    colors=max_colors,
+                    method=Image.Quantize.MAXCOVERAGE,
+                    dither=Image.Dither.NONE,
+                )
+            except Exception:
+                q = rgb.quantize(colors=max_colors, dither=Image.Dither.NONE)
+
+        # Critical: let Pillow map palette indices → true RGB
+        q_rgb = q.convert("RGB")
+        qpx = q_rgb.load()
+        apx = alpha.load()
+        out = Image.new("RGBA", (w, h))
         opx = out.load()
         for y in range(h):
             for x in range(w):
-                if src[x, y][3] < 128:
+                if apx[x, y] < 128:
                     opx[x, y] = (0, 0, 0, 0)
                 else:
                     r, g, b = qpx[x, y]
-                    opx[x, y] = (r, g, b, 255)
+                    opx[x, y] = (int(r), int(g), int(b), 255)
         return out
 
-    def _rgba_image_to_doc(self, img: Image.Image, max_colors: int = 64) -> PixelDocument:
+    def _rgba_image_to_doc(
+        self, img: Image.Image, max_colors: int = 256, quantize: bool = True
+    ) -> PixelDocument:
         """Convert RGBA PIL image into a PixelDocument (palette indices)."""
-        img = self._quantize_rgba(img, max_colors) if max_colors < 256 else img.convert("RGBA")
+        img = img.convert("RGBA")
+        if quantize:
+            img = self._quantize_rgba(img, max_colors)
         w, h = img.size
         if w < 1 or h < 1:
             raise ValueError("Empty image")
         if w > 256 or h > 256:
-            raise ValueError("Result larger than 256×256")
+            raise ValueError("Result larger than 256×256 — use Import & pixelate")
         colors: dict = {}
         palette = ["#000000"]  # 0 transparent / black
         px = img.load()
         pixels = [[0 for _ in range(w)] for _ in range(h)]
-        max_pal = max(2, min(64, max_colors + 1))  # +1 for transparent slot
+        # max opaque slots = max_colors; index 0 reserved (up to 257 entries)
+        max_pal = max(2, min(257, int(max_colors) + 1))
         for y in range(h):
             for x in range(w):
                 r, g, b, a = px[x, y]
@@ -1793,7 +2478,8 @@ class PixelPainterApp:
                         palette.append(rgb_to_hex(r, g, b))
                 pixels[y][x] = colors[key]
         doc = PixelDocument(w, h, palette)
-        doc.pixels = pixels
+        doc.layers = [Layer("Frame 1", w, h, pixels)]
+        doc.active = 0
         return doc
 
     def cmd_replace_color(self) -> None:
@@ -1879,6 +2565,7 @@ class PixelPainterApp:
             if fi == ti:
                 dlg.destroy()
                 return
+            self._hist_push()
             changed = 0
             for y in range(self.doc.height):
                 for x in range(self.doc.width):
@@ -1927,181 +2614,286 @@ class PixelPainterApp:
 
     def _open_pixelate_dialog(self, src: Image.Image, source_path: str) -> None:
         """
-        Live pixelation: block-size slider + click-drag to phase the sample grid.
-        Apply replaces the current document (after confirm if dirty).
+        Live pixelation:
+          - LEFT: original image with movable green sample grid (drag to shift)
+          - RIGHT: pixelated result preview
+          - Block size slider + max colors (adaptive quantize)
         """
         dlg = tk.Toplevel(self.root)
-        dlg.title("Import & pixelate")
+        dlg.title("Import & pixelate — align grid, then Apply")
         dlg.configure(bg=Theme.BG_PANEL)
         dlg.transient(self.root)
         dlg.grab_set()
-        dlg.geometry("720x560")
-        dlg.minsize(560, 420)
+        dlg.geometry("900x620")
+        dlg.minsize(700, 480)
 
         sw, sh = src.size
-        # State: block size (source pixels per output pixel), grid offset
+        # Default ~48px-wide output (game-asset friendly)
+        default_out_w = max(8, min(128, min(sw, 48)))
+        default_block = max(1, sw // default_out_w)
         st = {
-            "block": max(2, min(32, max(sw, sh) // 32 or 2)),
+            "block": default_block,
             "ox": 0,
             "oy": 0,
-            "drag": None,  # (mx, my, ox0, oy0)
-            "photo": None,
-            "preview_img": None,
+            "drag": None,
+            "photo_src": None,
+            "photo_out": None,
+            "view_scale": 1.0,
+            "refreshing": False,
+            "refresh_job": None,
+            "src_copy": src.copy(),  # stable for resize
         }
 
         self._label(
             dlg,
-            "Drag preview to phase-align the sample grid. "
-            "Block size = resolution scale. Max colors = palette decimation.",
+            "LEFT = original + GREEN GRID (drag to shift).  "
+            "RIGHT = result.  Use Output width/height (real pixel count), not abstract block size.",
             bg=Theme.BG_PANEL,
-            fg=Theme.FG_DIM,
-            wraplength=680,
+            fg=Theme.FG,
+            wraplength=860,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=10, pady=(8, 4))
 
-        info = self._label(dlg, "", bg=Theme.BG_PANEL, fg=Theme.GREEN)
+        size_banner = self._label(
+            dlg, "Output: — × — px", bg=Theme.BG_PANEL, fg=Theme.GREEN,
+            font=("Segoe UI", 14, "bold"),
+        )
+        size_banner.pack(anchor=tk.W, padx=10, pady=(0, 2))
+        info = self._label(dlg, "", bg=Theme.BG_PANEL, fg=Theme.FG_DIM)
         info.pack(anchor=tk.W, padx=10)
 
-        # Preview canvas
-        prev_frame = tk.Frame(dlg, bg=Theme.BG)
-        prev_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
-        prev_frame.rowconfigure(0, weight=1)
-        prev_frame.columnconfigure(0, weight=1)
-        prev_cv = tk.Canvas(prev_frame, bg=Theme.CANVAS_BG, highlightthickness=1,
-                            highlightbackground=Theme.BORDER, cursor="fleur")
-        prev_cv.grid(row=0, column=0, sticky="nsew")
+        # Two preview panes
+        panes = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        panes.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        panes.columnconfigure(0, weight=1)
+        panes.columnconfigure(1, weight=1)
+        panes.rowconfigure(1, weight=1)
+
+        self._label(panes, "SOURCE + GRID (drag here to shift)", bg=Theme.BG_PANEL, fg=Theme.FG_DIM).grid(
+            row=0, column=0, sticky="w"
+        )
+        self._label(panes, "PIXELATED RESULT", bg=Theme.BG_PANEL, fg=Theme.FG_DIM).grid(
+            row=0, column=1, sticky="w", padx=(8, 0)
+        )
+
+        src_cv = tk.Canvas(
+            panes, bg=Theme.CANVAS_BG, highlightthickness=1,
+            highlightbackground=Theme.GREEN, cursor="fleur",
+        )
+        src_cv.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        out_cv = tk.Canvas(
+            panes, bg=Theme.CANVAS_BG, highlightthickness=1,
+            highlightbackground=Theme.BORDER, cursor="arrow",
+        )
+        out_cv.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
 
         ctrl = tk.Frame(dlg, bg=Theme.BG_PANEL)
         ctrl.pack(fill=tk.X, padx=10, pady=4)
         ctrl2 = tk.Frame(dlg, bg=Theme.BG_PANEL)
-        ctrl2.pack(fill=tk.X, padx=10, pady=4)
+        ctrl2.pack(fill=tk.X, padx=10, pady=2)
+        ctrl3 = tk.Frame(dlg, bg=Theme.BG_PANEL)
+        ctrl3.pack(fill=tk.X, padx=10, pady=2)
 
-        self._label(ctrl, "Block size", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
-        block_var = tk.IntVar(value=st["block"])
-        colors_var = tk.IntVar(value=16)  # default readable palette for game assets
+        # Primary control = desired output WIDTH in pixels (height follows aspect via block)
+        max_out_w = min(256, sw)
+        min_out_w = 4
+        out_w_var = tk.IntVar(value=min(max_out_w, max(min_out_w, default_out_w)))
+        colors_var = tk.IntVar(value=16)
+        # Internal block derived from width; kept for grid math
+        st["block"] = max(1, sw // max(1, out_w_var.get()))
+
+        def current_block() -> int:
+            tw = max(min_out_w, min(max_out_w, int(out_w_var.get())))
+            # block so output width ≈ tw: ow = (sw - ox) // b  ≈ tw
+            ox = int(st["ox"])
+            b = max(1, (sw - (ox % max(1, st["block"]))) // tw)
+            # Prefer simple: b = sw // tw (phase still works)
+            b = max(1, sw // tw)
+            return min(128, b)
+
+        def out_dims(b: int, ox: int, oy: int) -> Tuple[int, int]:
+            b = max(1, b)
+            ox, oy = ox % b, oy % b
+            ow = max(1, (sw - ox) // b)
+            oh = max(1, (sh - oy) // b)
+            return ow, oh
 
         def pixelate() -> Image.Image:
-            """Average each block → one pixel, then optional color decimation."""
-            b = max(1, int(block_var.get()))
-            ox, oy = st["ox"] % b, st["oy"] % b
-            usable_w = sw - ox
-            usable_h = sh - oy
-            ow = max(1, usable_w // b)
-            oh = max(1, usable_h // b)
-            crop = src.crop((ox, oy, ox + ow * b, oy + oh * b))
-            small = crop.resize((ow, oh), Image.Resampling.BOX)
-            mc = max(2, min(64, int(colors_var.get())))
-            small = PixelPainterApp._quantize_rgba(small, mc)
-            return small
-
-        def refresh(_=None) -> None:
-            b = max(1, min(128, int(block_var.get())))
-            block_var.set(b)
+            b = current_block()
             st["block"] = b
-            st["ox"] = int(st["ox"]) % b
-            st["oy"] = int(st["oy"]) % b
+            ox, oy = int(st["ox"]) % b, int(st["oy"]) % b
+            ow, oh = out_dims(b, ox, oy)
+            crop = st["src_copy"].crop((ox, oy, ox + ow * b, oy + oh * b))
+            small = crop.resize((ow, oh), Image.Resampling.BOX)
+            mc = max(1, min(256, int(colors_var.get())))
+            return PixelPainterApp._quantize_rgba(small, mc)
+
+        def schedule_refresh(_event=None) -> None:
+            # Debounce Configure storms (was causing RecursionError)
+            job = st.get("refresh_job")
+            if job is not None:
+                try:
+                    dlg.after_cancel(job)
+                except Exception:
+                    pass
+            st["refresh_job"] = dlg.after(40, refresh)
+
+        def refresh() -> None:
+            if st.get("refreshing"):
+                return
+            st["refreshing"] = True
+            st["refresh_job"] = None
             try:
-                mc = max(2, min(64, int(colors_var.get())))
-                colors_var.set(mc)
-            except Exception:
-                mc = 16
-                colors_var.set(16)
-            small = pixelate()
-            st["preview_img"] = small
-            ow, oh = small.size
-            prev_cv.update_idletasks()
-            cw = max(200, prev_cv.winfo_width() or 640)
-            ch = max(160, prev_cv.winfo_height() or 360)
-            scale = min(cw / max(1, ow), ch / max(1, oh), 32)
-            scale = max(1, int(scale))
-            big = small.resize((ow * scale, oh * scale), Image.Resampling.NEAREST)
-            if scale >= 4:
-                draw = ImageDraw.Draw(big)
-                gc = (92, 184, 92)
-                for x in range(0, big.width + 1, scale):
-                    draw.line([(x, 0), (x, big.height - 1)], fill=gc)
-                for y in range(0, big.height + 1, scale):
-                    draw.line([(0, y), (big.width - 1, y)], fill=gc)
-            st["photo"] = ImageTk.PhotoImage(big)
-            prev_cv.delete("all")
-            prev_cv.create_image(cw // 2, ch // 2, image=st["photo"], anchor=tk.CENTER)
-            # Count unique opaque colors in preview
-            uniq = set()
-            spx = small.load()
-            for yy in range(oh):
-                for xx in range(ow):
-                    r, g, b, a = spx[xx, yy]
-                    if a >= 128:
-                        uniq.add((r, g, b))
-            info.configure(
-                text=(
-                    f"Output {ow}×{oh} px   ·   block {b}×{b}   ·   "
-                    f"offset ({st['ox']}, {st['oy']})   ·   "
-                    f"max colors {mc} (≈{len(uniq)} used)   ·   source {sw}×{sh}"
-                )
-            )
-            if ow > 256 or oh > 256:
-                info.configure(
-                    text=info.cget("text") + "   ·   too big — increase block size (max 256)"
+                b = current_block()
+                st["block"] = b
+                st["ox"] = int(st["ox"]) % b
+                st["oy"] = int(st["oy"]) % b
+                try:
+                    mc = max(1, min(256, int(colors_var.get())))
+                    colors_var.set(mc)
+                except Exception:
+                    mc = 16
+                    colors_var.set(16)
+
+                ow, oh = out_dims(b, st["ox"], st["oy"])
+                size_banner.configure(text=f"Output: {ow} × {oh} pixels")
+
+                # --- LEFT: source + grid (safe resize via RGB copy) ---
+                src_cv.update_idletasks()
+                cw = max(120, int(src_cv.winfo_width() or 400))
+                ch = max(120, int(src_cv.winfo_height() or 360))
+                if cw < 20 or ch < 20:
+                    return
+                vs = min(cw / sw, ch / sh)
+                vs = max(0.05, min(vs, 8.0))
+                st["view_scale"] = vs
+                dw, dh = max(1, int(sw * vs)), max(1, int(sh * vs))
+                # Avoid Pillow RGBA premultiply path quirks: resize RGB + paste alpha
+                base = st["src_copy"]
+                rgb = base.convert("RGB").resize((dw, dh), Image.Resampling.BILINEAR)
+                alpha = base.split()[3].resize((dw, dh), Image.Resampling.BILINEAR)
+                disp = rgb.convert("RGBA")
+                disp.putalpha(alpha)
+                draw = ImageDraw.Draw(disp)
+                step = max(1.0, b * vs)
+                off_x = (st["ox"] % b) * vs
+                off_y = (st["oy"] % b) * vs
+                x = off_x
+                while x < dw + 1:
+                    xi = int(round(x))
+                    draw.line([(xi, 0), (xi, dh - 1)], fill=(92, 184, 92), width=1)
+                    x += step
+                y = off_y
+                while y < dh + 1:
+                    yi = int(round(y))
+                    draw.line([(0, yi), (dw - 1, yi)], fill=(92, 184, 92), width=1)
+                    y += step
+                oxi, oyi = int(round(off_x)), int(round(off_y))
+                draw.line([(oxi - 6, oyi), (oxi + 6, oyi)], fill=(200, 230, 200), width=2)
+                draw.line([(oxi, oyi - 6), (oxi, oyi + 6)], fill=(200, 230, 200), width=2)
+
+                st["photo_src"] = ImageTk.PhotoImage(disp)
+                src_cv.delete("all")
+                src_cv.create_image(cw // 2, ch // 2, image=st["photo_src"], anchor=tk.CENTER)
+                src_cv.create_text(
+                    8, 8, anchor=tk.NW, fill="#c8c8c8",
+                    text="DRAG green grid to align",
+                    font=("Segoe UI", 9),
                 )
 
-        def on_block(_=None) -> None:
-            b = max(1, int(block_var.get()))
+                # --- RIGHT: pixelated result ---
+                small = pixelate()
+                st["preview_img"] = small
+                ow, oh = small.size
+                out_cv.update_idletasks()
+                ocw = max(120, int(out_cv.winfo_width() or 400))
+                och = max(120, int(out_cv.winfo_height() or 360))
+                oscale = min(ocw / max(1, ow), och / max(1, oh), 24)
+                oscale = max(1, int(oscale))
+                big = small.resize((ow * oscale, oh * oscale), Image.Resampling.NEAREST)
+                if oscale >= 3:
+                    d2 = ImageDraw.Draw(big)
+                    for gx in range(0, big.width + 1, oscale):
+                        d2.line([(gx, 0), (gx, big.height - 1)], fill=(60, 60, 60))
+                    for gy in range(0, big.height + 1, oscale):
+                        d2.line([(0, gy), (big.width - 1, gy)], fill=(60, 60, 60))
+                st["photo_out"] = ImageTk.PhotoImage(big)
+                out_cv.delete("all")
+                out_cv.create_image(ocw // 2, och // 2, image=st["photo_out"], anchor=tk.CENTER)
+                out_cv.create_text(
+                    8, 8, anchor=tk.NW, fill="#5cb85c",
+                    text=f"{ow} × {oh} px",
+                    font=("Segoe UI", 11, "bold"),
+                )
+
+                uniq = set()
+                spx = small.load()
+                for yy in range(oh):
+                    for xx in range(ow):
+                        r, g, b, a = spx[xx, yy]
+                        if a >= 128:
+                            uniq.add((r, g, b))
+                warn = ""
+                if ow > 256 or oh > 256:
+                    warn = "  ·  TOO BIG — lower Output width"
+                info.configure(
+                    text=(
+                        f"Source {sw}×{sh}  ·  sample step {b}px  ·  "
+                        f"grid shift ({st['ox']},{st['oy']})  ·  "
+                        f"colors ≤{mc} (using {len(uniq)}){warn}"
+                    )
+                )
+            except Exception as ex:
+                info.configure(text=f"Preview error: {ex}")
+            finally:
+                st["refreshing"] = False
+
+        def on_width_change(_=None) -> None:
+            try:
+                tw = max(min_out_w, min(max_out_w, int(out_w_var.get())))
+            except Exception:
+                tw = default_out_w
+            out_w_var.set(tw)
+            b = max(1, sw // tw)
+            st["block"] = b
             st["ox"] %= b
             st["oy"] %= b
-            refresh()
+            schedule_refresh()
 
-        scale = tk.Scale(
-            ctrl,
-            from_=1,
-            to=64,
-            orient=tk.HORIZONTAL,
-            variable=block_var,
-            command=on_block,
-            bg=Theme.BG_PANEL,
-            fg=Theme.FG,
-            troughcolor=Theme.BG_INPUT,
-            highlightthickness=0,
-            activebackground=Theme.GREEN,
-            length=280,
-            showvalue=True,
-        )
-        scale.pack(side=tk.LEFT, padx=8)
+        self._label(ctrl, "Output width (pixels)", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
+        tk.Scale(
+            ctrl, from_=min_out_w, to=max_out_w, orient=tk.HORIZONTAL, variable=out_w_var,
+            command=on_width_change, bg=Theme.BG_PANEL, fg=Theme.FG,
+            troughcolor=Theme.BG_INPUT, highlightthickness=0,
+            activebackground=Theme.GREEN, length=360, showvalue=True,
+        ).pack(side=tk.LEFT, padx=8)
+        self._label(
+            ctrl, "← sets how many pixels wide the result is",
+            bg=Theme.BG_PANEL, fg=Theme.FG_DIM,
+        ).pack(side=tk.LEFT)
 
         self._label(ctrl2, "Max colors", bg=Theme.BG_PANEL).pack(side=tk.LEFT)
-        color_scale = tk.Scale(
-            ctrl2,
-            from_=2,
-            to=64,
-            orient=tk.HORIZONTAL,
-            variable=colors_var,
-            command=lambda _=None: refresh(),
-            bg=Theme.BG_PANEL,
-            fg=Theme.FG,
-            troughcolor=Theme.BG_INPUT,
-            highlightthickness=0,
-            activebackground=Theme.GREEN,
-            length=280,
-            showvalue=True,
-        )
-        color_scale.pack(side=tk.LEFT, padx=8)
-        self._label(
-            ctrl2,
-            "(median-cut, no dither)",
-            bg=Theme.BG_PANEL,
-            fg=Theme.FG_DIM,
-        ).pack(side=tk.LEFT, padx=4)
+        tk.Scale(
+            ctrl2, from_=1, to=256, orient=tk.HORIZONTAL, variable=colors_var,
+            command=lambda _=None: schedule_refresh(), bg=Theme.BG_PANEL, fg=Theme.FG,
+            troughcolor=Theme.BG_INPUT, highlightthickness=0,
+            activebackground=Theme.GREEN, length=320, showvalue=True,
+        ).pack(side=tk.LEFT, padx=8)
 
+        self._label(ctrl3, "Shift grid:", bg=Theme.BG_PANEL, fg=Theme.GREEN).pack(side=tk.LEFT)
         def nudge(dx: int, dy: int) -> None:
-            b = max(1, int(block_var.get()))
+            b = max(1, sw // max(1, int(out_w_var.get())))
             st["ox"] = (st["ox"] + dx) % b
             st["oy"] = (st["oy"] + dy) % b
-            refresh()
+            schedule_refresh()
 
-        for lab, dx, dy in [("←", -1, 0), ("→", 1, 0), ("↑", 0, -1), ("↓", 0, 1)]:
-            bb = tk.Button(ctrl, text=lab, command=lambda a=dx, c=dy: nudge(a, c), width=3)
+        for lab, dx, dy in [
+            ("←1", -1, 0), ("→1", 1, 0), ("↑1", 0, -1), ("↓1", 0, 1),
+            ("←4", -4, 0), ("→4", 4, 0), ("↑4", 0, -4), ("↓4", 0, 4),
+        ]:
+            bb = tk.Button(ctrl3, text=lab, command=lambda a=dx, c=dy: nudge(a, c), width=4)
             self._style_btn(bb)
-            bb.pack(side=tk.LEFT, padx=2)
+            bb.pack(side=tk.LEFT, padx=1)
 
         def on_press(e) -> None:
             st["drag"] = (e.x, e.y, st["ox"], st["oy"])
@@ -2110,24 +2902,25 @@ class PixelPainterApp:
             if not st["drag"]:
                 return
             x0, y0, ox0, oy0 = st["drag"]
-            b = max(1, int(block_var.get()))
-            # 1 screen-pixel drag → 1 source-pixel phase shift (wraps in block)
-            dx = e.x - x0
-            dy = e.y - y0
+            b = max(1, sw // max(1, int(out_w_var.get())))
+            vs = max(0.05, st["view_scale"])
+            dx = int(round((e.x - x0) / vs))
+            dy = int(round((e.y - y0) / vs))
             st["ox"] = (ox0 + dx) % b
             st["oy"] = (oy0 + dy) % b
-            refresh()
+            schedule_refresh()
 
         def on_release(_e=None) -> None:
             st["drag"] = None
 
-        prev_cv.bind("<ButtonPress-1>", on_press)
-        prev_cv.bind("<B1-Motion>", on_drag)
-        prev_cv.bind("<ButtonRelease-1>", on_release)
-        prev_cv.bind("<Configure>", lambda e: refresh())
+        src_cv.bind("<ButtonPress-1>", on_press)
+        src_cv.bind("<B1-Motion>", on_drag)
+        src_cv.bind("<ButtonRelease-1>", on_release)
+        src_cv.bind("<Configure>", schedule_refresh)
+        out_cv.bind("<Configure>", schedule_refresh)
 
         btn_row = tk.Frame(dlg, bg=Theme.BG_PANEL)
-        btn_row.pack(fill=tk.X, padx=10, pady=(0, 10))
+        btn_row.pack(fill=tk.X, padx=10, pady=(4, 10))
 
         def apply() -> None:
             small = pixelate()
@@ -2135,15 +2928,15 @@ class PixelPainterApp:
             if ow > 256 or oh > 256:
                 messagebox.showerror(
                     APP_NAME,
-                    f"Result is {ow}×{oh}. Max is 256×256 — increase block size.",
+                    f"Result is {ow}×{oh}. Max canvas is 256×256 — lower Output width.",
                     parent=dlg,
                 )
                 return
             if not self._confirm_discard():
                 return
             try:
-                mc = max(2, min(64, int(colors_var.get())))
-                self.doc = self._rgba_image_to_doc(small, max_colors=mc)
+                mc = max(1, min(256, int(colors_var.get())))
+                self.doc = self._rgba_image_to_doc(small, max_colors=mc, quantize=False)
                 self.doc.path = None
                 self.doc.dirty = True
                 self.color_idx = min(1, len(self.doc.palette) - 1)
@@ -2151,8 +2944,10 @@ class PixelPainterApp:
                 self.sel_cells = set()
                 self.float_items = []
                 self.moving = False
+                self._hist_clear()
                 add_recent(source_path)
                 self._rebuild_palette_swatches()
+                self._rebuild_layer_list()
                 self._rebuild_recent_menu()
                 self._refresh_title()
                 self._redraw()
@@ -2166,15 +2961,14 @@ class PixelPainterApp:
         b_cancel = tk.Button(btn_row, text="Cancel", command=dlg.destroy)
         self._style_btn(b_cancel)
         b_cancel.pack(side=tk.LEFT, padx=4)
-
         self._label(
             btn_row,
-            "Tip: drag preview to phase-align edges/features under the grid.",
+            "Drag LEFT pane (green grid) until edges look right, then Apply.",
             bg=Theme.BG_PANEL,
             fg=Theme.FG_DIM,
         ).pack(side=tk.RIGHT, padx=8)
 
-        dlg.after(80, refresh)
+        dlg.after(120, schedule_refresh)
 
     def cmd_save(self) -> None:
         if self.doc.path and self.doc.path.lower().endswith(".ppix"):
@@ -2382,6 +3176,7 @@ class PixelPainterApp:
         ent.bind("<Return>", from_entry)
 
         def apply() -> None:
+            self._hist_push()
             self.doc.palette[idx] = state["hex"]
             self.doc.dirty = True
             self._rebuild_palette_swatches()
@@ -2558,22 +3353,19 @@ class PixelPainterApp:
                 f"{APP_NAME}\n"
                 f"{APP_TAGLINE}\n"
                 "License: CC BY-NC-SA 4.0 (attribution, non-commercial).\n\n"
-                "Project:  .ppix  (palette + indices)\n"
-                "Export PNG: lossless, scale 1 = 1:1 pixels\n"
-                "Export C: RGB565 arrays for embedded targets\n\n"
+                "Project:  .ppix v2  (palette + layers + indices)\n"
+                "Export PNG/C: composites visible layers\n\n"
                 "Index 0 = transparent on PNG / 0x0000 in C\n"
-                "Canvas BG is editor-only (empty vs painted cells).\n\n"
-                "Space+drag: erase while Paint (trackpad-friendly).\n"
-                "Box/Free select → Move → drag → Place (clips off-grid).\n"
-                "Pick→slot: screen color into current palette slot.\n"
-                "View menu: canvas background color.\n\n"
-                "Import & pixelate (Ctrl+I): block size + max colors,\n"
-                "  drag preview to align the sample grid.\n"
-                "Replace drawn color: remap index A→B on the canvas.\n"
-                "  (Wheel-edit of a swatch also recolors that index.)\n\n"
+                "Layers / Frames (right panel):\n"
+                "  New blank · Clone active · rename double-click\n"
+                "  ▲▼ stack order · 👁 visibility · paint = active only\n"
+                "  Use clones for animation frames / side views.\n\n"
+                "Import & pixelate (Ctrl+I): grid align + max colors\n"
+                "  (color quantize fixed — no more black/purple mess)\n\n"
                 "Keys: 1-4 brush  B/E/F/I  R box  L free  M move/place\n"
+                "  Ctrl+Z undo  ·  Ctrl+Shift+Z redo (50 steps)\n"
                 "  G grid  P pick  C wheel  Esc clear select  Space invert\n"
-                "  Alt+drag / middle-drag = pan  ·  Ctrl+/- zoom"
+                "  Alt+drag pan  ·  Ctrl+/- zoom"
             ),
             parent=self.root,
         )

@@ -41,11 +41,19 @@ Requires Python 3.10+ and Pillow.
 - Brush sizes 1×1 … 4×4
 - **Space + drag** — erase while Paint is selected (trackpad-friendly)
 - Grid size 1–256 per side (default **32×32**)
-- **Import & pixelate** (`Ctrl+I`) — open any photo/sprite, **block-size slider**,
-  **max-colors** decimation (median-cut, no dither), **click-drag** to shift the
-  sample grid so edges line up, then Apply
-- **Replace drawn color** — remap every pixel of palette index A → index B  
-  (also: editing a swatch with the **Wheel** recolors all pixels using that slot)
+- **Open** accepts **png / jpg / bmp / gif / webp** (not only PNG)
+- Large images auto-open **Import & pixelate** (no MS Paint pre-resize)
+- **Import & pixelate** (`Ctrl+I`):
+  - LEFT = original + **green sample grid** — **drag to move the grid**
+  - RIGHT = pixelated result
+  - **Output width** = real pixel count of the result
+  - **Max colors** = **1–256** median-cut quantize (correct colors; no black/purple bug)
+- **Layers / frames** (right panel): **New**, **Clone**, rename, reorder, show/hide  
+  Paint hits the **active** layer; canvas/export **stack** all visible layers.  
+  Use clones for animation frames or side/angle views.
+- **Resize** asks: **scale image** (nearest) vs crop/pad canvas only
+- **Replace drawn color** — remap index A → B on the canvas  
+  (Wheel-edit of a swatch also recolors that index everywhere)
 
 ### Navigation
 - **Scrollbars** when the image is larger than the window
@@ -82,6 +90,8 @@ Requires Python 3.10+ and Pillow.
 | `Alt` + drag | Pan |
 | `Ctrl` + `+` / `-` | Zoom in / out |
 | `Ctrl` + `0` | Reset zoom |
+| `Ctrl` + `Z` | Undo (50 steps) |
+| `Ctrl` + `Shift` + `Z` | Redo (`Ctrl+Y` also) |
 | `P` | Screen pick → palette slot |
 | `C` | Color wheel |
 | `G` | Toggle grid |
