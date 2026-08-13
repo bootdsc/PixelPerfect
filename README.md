@@ -18,7 +18,7 @@ Dark-mode pixel art editor for game assets (sprites, tiles, icons). Trackpad-fri
 
 **[Latest release](https://github.com/bootdsc/PixelPainter/releases)** includes:
 
-- `PixelPainter.exe` — portable Windows app (no install)
+- `PixelPainter.zip` — Windows folder (`PixelPainter.exe` + libs). Unzip and run the exe. Not a single packed file (those trip VirusTotal).
 - `pixel_painter.py` — full source script
 
 ---
@@ -127,17 +127,16 @@ User settings and recent-file list live in the user’s home directory under `.p
 
 ---
 
-## Rebuild Windows EXE
+## Rebuild Windows app
 
-From this directory:
+Onedir, **no UPX**. Do not use `--onefile` or UPX — both are why VirusTotal flags the old exe.
 
 ```bash
 pip install pyinstaller pillow
-python -m PyInstaller --noconfirm --onefile --windowed --name PixelPainter \
-  --distpath dist --workpath build --specpath . pixel_painter.py
+python -m PyInstaller --noconfirm PixelPainter.spec
 ```
 
-Output: `dist/PixelPainter.exe`
+Output: `dist/PixelPainter/PixelPainter.exe` (keep the whole folder). Zip that folder for a release.
 
 ---
 
