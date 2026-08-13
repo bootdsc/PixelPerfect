@@ -137,10 +137,10 @@ Onedir, **no UPX**. Do not use `--onefile` or UPX — both are why VirusTotal fl
 
 ```bash
 pip install pyinstaller pillow
-python -m PyInstaller --noconfirm PixelPainter.spec
+python -m PyInstaller --noconfirm PixelPerfect.spec
 ```
 
-Output: `dist/PixelPainter/PixelPainter.exe` (keep the whole folder). Zip that folder for a release.
+Output: `dist/PixelPerfect/PixelPerfect.exe` (keep the whole folder). Zip that folder for a release.
 
 ---
 
