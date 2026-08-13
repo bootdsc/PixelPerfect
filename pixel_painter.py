@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PixelPainter — dark-mode pixel art tool for game assets.
+PixelPerfect — dark-mode pixel art tool for game assets.
 
 Created by Bootdsc for all you Chooms to use, copy, and modify
 (CC BY-NC-SA 4.0 — attribution required, non-commercial).
@@ -43,7 +43,7 @@ class Theme:
     CHECKER_A = "#1e1e1e"
     CHECKER_B = "#161616"
 
-APP_NAME = "PixelPainter"
+APP_NAME = "PixelPerfect"
 APP_AUTHOR = "Bootdsc"
 APP_TAGLINE = "Created by Bootdsc for all you Chooms to use, copy, and modify."
 APP_DIR = Path.home() / ".pixel_painter"
@@ -190,6 +190,7 @@ DEFAULT_PALETTE = list(MS_PAINT_PALETTE)
 
 DEFAULT_GRID_W = 32
 DEFAULT_GRID_H = 32
+GRID_MAX = 512  # hulls: mothership 480×120, dropship ~200×180
 MIN_CELL_PX = 8
 MAX_CELL_PX = 48
 DEFAULT_CELL_PX = 16
@@ -449,8 +450,8 @@ class PixelDocument:
         height: int = DEFAULT_GRID_H,
         palette: Optional[List[str]] = None,
     ):
-        self.width = max(1, min(256, width))
-        self.height = max(1, min(256, height))
+        self.width = max(1, min(GRID_MAX, width))
+        self.height = max(1, min(GRID_MAX, height))
         self.palette = list(palette or DEFAULT_PALETTE)
         self.layers: List[Layer] = [Layer("Frame 1", self.width, self.height)]
         self.active = 0
@@ -509,8 +510,8 @@ class PixelDocument:
         self.dirty = True
 
     def resize(self, w: int, h: int, keep: bool = True) -> None:
-        w = max(1, min(256, w))
-        h = max(1, min(256, h))
+        w = max(1, min(GRID_MAX, w))
+        h = max(1, min(GRID_MAX, h))
         for layer in self.layers:
             new_px = empty_grid(w, h)
             if keep:
@@ -522,8 +523,8 @@ class PixelDocument:
         self.dirty = True
 
     def scale_nearest(self, w: int, h: int) -> None:
-        w = max(1, min(256, w))
-        h = max(1, min(256, h))
+        w = max(1, min(GRID_MAX, w))
+        h = max(1, min(GRID_MAX, h))
         if w == self.width and h == self.height:
             return
         old_w, old_h = self.width, self.height
@@ -756,16 +757,20 @@ class PixelPainterApp:
 
     # ----- UI chrome -----
     def _style_btn(self, btn: tk.Button, active: bool = False) -> None:
+        # Visible borders so controls read as buttons (FLAT+bd=0 was invisible)
         btn.configure(
-            bg=Theme.GREEN_DK if active else Theme.BG_PANEL,
+            bg=Theme.GREEN_DK if active else Theme.BG_INPUT,
             fg=Theme.FG,
             activebackground=Theme.GREEN,
             activeforeground=Theme.BG,
-            relief=tk.FLAT,
-            bd=0,
+            disabledforeground=Theme.FG_DIM,
+            relief=tk.SOLID,
+            borderwidth=1,
+            bd=1,
             highlightthickness=1,
-            highlightbackground=Theme.GREEN if active else Theme.BORDER,
+            highlightbackground=Theme.GREEN if active else Theme.GREEN_DK,
             highlightcolor=Theme.GREEN,
+            overrelief=tk.RIDGE,
             padx=8,
             pady=4,
             cursor="hand2",
@@ -892,6 +897,11 @@ class PixelPainterApp:
         edit_m.add_command(label="Screen pick → palette", command=self.cmd_screen_pick, accelerator="P")
         edit_m.add_separator()
         edit_m.add_command(label="Clear selection", command=self.cmd_clear_selection)
+        edit_m.add_separator()
+        edit_m.add_command(label="Flip horizontal", command=lambda: self.cmd_flip(True), accelerator="H")
+        edit_m.add_command(label="Flip vertical", command=lambda: self.cmd_flip(False), accelerator="V")
+        edit_m.add_command(label="Clone + flip H", command=lambda: self.cmd_clone_flip(True), accelerator="Shift+H")
+        edit_m.add_command(label="Clone + flip V", command=lambda: self.cmd_clone_flip(False), accelerator="Shift+V")
         menubar.add_cascade(label="Edit", menu=edit_m)
 
         view_m = tk.Menu(menubar, tearoff=0, bg=Theme.BG_PANEL, fg=Theme.FG,
@@ -1081,6 +1091,22 @@ class PixelPainterApp:
         b_clr = tk.Button(left, text="Clear select", command=self.cmd_clear_selection)
         self._style_btn(b_clr)
         b_clr.pack(fill=tk.X, padx=8, pady=2)
+        flip_row = tk.Frame(left, bg=Theme.BG_PANEL)
+        flip_row.pack(fill=tk.X, padx=8, pady=2)
+        b_fh = tk.Button(flip_row, text="Flip H", command=lambda: self.cmd_flip(True))
+        b_fv = tk.Button(flip_row, text="Flip V", command=lambda: self.cmd_flip(False))
+        self._style_btn(b_fh)
+        self._style_btn(b_fv)
+        b_fh.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        b_fv.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+        clone_row = tk.Frame(left, bg=Theme.BG_PANEL)
+        clone_row.pack(fill=tk.X, padx=8, pady=2)
+        b_ch = tk.Button(clone_row, text="Clone flip H", command=lambda: self.cmd_clone_flip(True))
+        b_cv = tk.Button(clone_row, text="Clone flip V", command=lambda: self.cmd_clone_flip(False))
+        self._style_btn(b_ch)
+        self._style_btn(b_cv)
+        b_ch.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        b_cv.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
 
         self._label(
             left,
@@ -1088,6 +1114,7 @@ class PixelPainterApp:
             "Move = lift & drag\n"
             "(off-grid OK)\n"
             "Place = drop (clips)\n"
+            "H/V flip  Shift+H/V clone\n"
             "Space+drag = erase\n"
             "  on Paint tool",
             bg=Theme.BG_PANEL,
@@ -1332,6 +1359,10 @@ class PixelPainterApp:
         r.bind("r", lambda e: self._set_tool("sel_box"))
         r.bind("l", lambda e: self._set_tool("sel_free"))
         r.bind("m", lambda e: self.cmd_toggle_move())
+        r.bind("h", lambda e: self.cmd_flip(True))
+        r.bind("H", lambda e: self.cmd_clone_flip(True))
+        r.bind("v", lambda e: self.cmd_flip(False))
+        r.bind("V", lambda e: self.cmd_clone_flip(False))
         r.bind("g", lambda e: (self.show_grid.set(not self.show_grid.get()), self._on_view_toggle()))
         r.bind("p", lambda e: self.cmd_screen_pick())
         r.bind("P", lambda e: self.cmd_screen_pick())
@@ -1715,6 +1746,85 @@ class PixelPainterApp:
         self._redraw()
         self._refresh_title()
         self.status.configure(text="Placed (off-grid clipped)")
+
+    def _gather_sel_items(self) -> Optional[Tuple[int, int, int, int, List[Tuple[int, int, int]]]]:
+        if not self.sel_cells:
+            return None
+        items: List[Tuple[int, int, int]] = []
+        for x, y in self.sel_cells:
+            idx = self.doc.get_pixel(x, y)
+            if idx == 0:
+                continue
+            items.append((x, y, idx))
+        if not items:
+            return None
+        xs = [p[0] for p in items]
+        ys = [p[1] for p in items]
+        return min(xs), min(ys), max(xs), max(ys), items
+
+    @staticmethod
+    def _flip_local(items: List[Tuple[int, int, int]], w: int, h: int, horizontal: bool):
+        out = []
+        for lx, ly, idx in items:
+            if horizontal:
+                out.append((w - 1 - lx, ly, idx))
+            else:
+                out.append((lx, h - 1 - ly, idx))
+        return out
+
+    def cmd_flip(self, horizontal: bool) -> None:
+        axis = "H" if horizontal else "V"
+        if self.moving and self.float_items:
+            xs = [p[0] for p in self.float_items]
+            ys = [p[1] for p in self.float_items]
+            w, h = max(xs) + 1, max(ys) + 1
+            self.float_items = self._flip_local(self.float_items, w, h, horizontal)
+            self._redraw()
+            self.status.configure(text=f"Flipped {axis} (floating)")
+            return
+        packed = self._gather_sel_items()
+        if not packed:
+            messagebox.showinfo(APP_NAME, "Select pixels first (Box or Free).", parent=self.root)
+            return
+        min_x, min_y, max_x, max_y, items = packed
+        self._hist_push()
+        for x, y, _idx in items:
+            self.doc.set_pixel(x, y, 0)
+        w, h = max_x - min_x + 1, max_y - min_y + 1
+        local = [(x - min_x, y - min_y, idx) for x, y, idx in items]
+        for lx, ly, idx in self._flip_local(local, w, h, horizontal):
+            self.doc.set_pixel(min_x + lx, min_y + ly, idx)
+        self.doc.dirty = True
+        self._redraw()
+        self._refresh_title()
+        self.status.configure(text=f"Flipped {axis} in place")
+
+    def cmd_clone_flip(self, horizontal: bool) -> None:
+        axis = "H" if horizontal else "V"
+        if self.moving and self.float_items:
+            xs = [p[0] for p in self.float_items]
+            ys = [p[1] for p in self.float_items]
+            w, h = max(xs) + 1, max(ys) + 1
+            flipped = self._flip_local(self.float_items, w, h, horizontal)
+            dx, dy = (w, 0) if horizontal else (0, h)
+            self.float_items = list(self.float_items) + [(lx + dx, ly + dy, i) for lx, ly, i in flipped]
+            self._redraw()
+            self.status.configure(text=f"Clone flipped {axis} — drag, Place to drop")
+            return
+        packed = self._gather_sel_items()
+        if not packed:
+            messagebox.showinfo(APP_NAME, "Select pixels first (Box or Free).", parent=self.root)
+            return
+        min_x, min_y, max_x, max_y, items = packed
+        w, h = max_x - min_x + 1, max_y - min_y + 1
+        local = [(x - min_x, y - min_y, idx) for x, y, idx in items]
+        self.float_items = self._flip_local(local, w, h, horizontal)
+        self.float_ox = min_x + (w if horizontal else 0)
+        self.float_oy = min_y + (0 if horizontal else h)
+        self.moving = True
+        self._update_move_btn()
+        self._redraw()
+        self.status.configure(text=f"Clone flipped {axis} — drag, Place to drop")
 
     def _apply_brush(self, cx: int, cy: int, idx: int) -> None:
         b = self.brush
@@ -2147,13 +2257,13 @@ class PixelPainterApp:
             return
         w = simpledialog.askinteger(
             "New", "Width (pixels):", initialvalue=DEFAULT_GRID_W,
-            minvalue=1, maxvalue=256, parent=self.root,
+            minvalue=1, maxvalue=GRID_MAX, parent=self.root,
         )
         if not w:
             return
         h = simpledialog.askinteger(
             "New", "Height (pixels):", initialvalue=DEFAULT_GRID_H,
-            minvalue=1, maxvalue=256, parent=self.root,
+            minvalue=1, maxvalue=GRID_MAX, parent=self.root,
         )
         if not h:
             return
@@ -2168,13 +2278,13 @@ class PixelPainterApp:
     def cmd_resize(self) -> None:
         w = simpledialog.askinteger(
             "Resize / scale", "New width:", initialvalue=self.doc.width,
-            minvalue=1, maxvalue=256, parent=self.root,
+            minvalue=1, maxvalue=GRID_MAX, parent=self.root,
         )
         if not w:
             return
         h = simpledialog.askinteger(
             "Resize / scale", "New height:", initialvalue=self.doc.height,
-            minvalue=1, maxvalue=256, parent=self.root,
+            minvalue=1, maxvalue=GRID_MAX, parent=self.root,
         )
         if not h:
             return
@@ -2332,7 +2442,7 @@ class PixelPainterApp:
             elif suf in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"):
                 img = Image.open(path).convert("RGBA")
                 # Large photos → pixelate dialog (block size + grid align + colors)
-                if img.width > 256 or img.height > 256:
+                if img.width > GRID_MAX or img.height > GRID_MAX:
                     messagebox.showinfo(
                         APP_NAME,
                         f"Image is {img.width}×{img.height}.\n"
@@ -2447,8 +2557,8 @@ class PixelPainterApp:
         w, h = img.size
         if w < 1 or h < 1:
             raise ValueError("Empty image")
-        if w > 256 or h > 256:
-            raise ValueError("Result larger than 256×256 — use Import & pixelate")
+        if w > GRID_MAX or h > GRID_MAX:
+            raise ValueError(f"Result larger than {GRID_MAX}×{GRID_MAX} — use Import & pixelate")
         colors: dict = {}
         palette = ["#000000"]  # 0 transparent / black
         px = img.load()
@@ -3363,6 +3473,7 @@ class PixelPainterApp:
                 "Import & pixelate (Ctrl+I): grid align + max colors\n"
                 "  (color quantize fixed — no more black/purple mess)\n\n"
                 "Keys: 1-4 brush  B/E/F/I  R box  L free  M move/place\n"
+                "  H/V flip  Shift+H/V clone+flip\n"
                 "  Ctrl+Z undo  ·  Ctrl+Shift+Z redo (50 steps)\n"
                 "  G grid  P pick  C wheel  Esc clear select  Space invert\n"
                 "  Alt+drag pan  ·  Ctrl+/- zoom"

@@ -1,4 +1,4 @@
-# PixelPainter
+# PixelPerfect
 
 Created by **Bootdsc** for all you Chooms to use, copy, and modify.
 
@@ -10,15 +10,15 @@ Dark-mode pixel art editor for game assets (sprites, tiles, icons). Trackpad-fri
 | **License** | [CC BY-NC-SA 4.0](LICENSE) |
 | **Default canvas** | **32×32** |
 | **Source** | `pixel_painter.py` |
-| **Windows build** | [Releases](https://github.com/bootdsc/PixelPainter/releases) |
+| **Windows build** | [Releases](https://github.com/bootdsc/PixelPerfect/releases) |
 
 ---
 
 ## Download
 
-**[Latest release](https://github.com/bootdsc/PixelPainter/releases)** includes:
+**[Latest release](https://github.com/bootdsc/PixelPerfect/releases)** includes:
 
-- `PixelPainter.zip` — Windows folder (`PixelPainter.exe` + libs). Unzip and run the exe. Not a single packed file (those trip VirusTotal).
+- `PixelPerfect.zip` — Windows folder (`PixelPerfect.exe` + libs). Unzip and run the exe. Not a single packed file (those trip VirusTotal).
 - `pixel_painter.py` — full source script
 
 ---
@@ -70,6 +70,8 @@ Requires Python 3.10+ and Pillow.
 ### Selection
 - Box and Free select
 - Move / Place (left panel): lift, drag off-grid for alignment, place (clips outside)
+- **Flip H / V** on the selection (or a floating lift)
+- **Clone + flip H / V** — original stays; mirrored copy is ready to place (draw one side)
 
 ### Files
 - `.ppix` project (Save / Save As / Recent)
@@ -86,6 +88,8 @@ Requires Python 3.10+ and Pillow.
 | `B` / `E` / `F` / `I` | Paint / Erase / Fill / Eyedrop |
 | `R` / `L` | Box / Free select |
 | `M` | Move / Place selection |
+| `H` / `V` | Flip selection horizontal / vertical |
+| `Shift+H` / `Shift+V` | Clone + flip (stamp the other side) |
 | `Space` (hold) | Invert paint↔erase while drawing |
 | `Alt` + drag | Pan |
 | `Ctrl` + `+` / `-` | Zoom in / out |
@@ -115,7 +119,7 @@ Index **0** = transparent on PNG / `0x0000` in C.
 ## Project layout
 
 ```
-PixelPainter/
+PixelPerfect/
   pixel_painter.py    # application source
   requirements.txt    # Pillow
   LICENSE             # CC BY-NC-SA 4.0
@@ -145,7 +149,7 @@ Output: `dist/PixelPainter/PixelPainter.exe` (keep the whole folder). Zip that f
 **CC BY-NC-SA 4.0**
 
 - ✅ Use, copy, modify, share  
-- ✅ Give **attribution** to Bootdsc / PixelPainter  
+- ✅ Give **attribution** to Bootdsc / PixelPerfect  
 - ✅ Keep derivatives under the **same license**  
 - ❌ **No commercial use** (do not sell the app or paid redistributions)
 
@@ -153,5 +157,5 @@ See [LICENSE](LICENSE) and https://creativecommons.org/licenses/by-nc-sa/4.0/
 
 ### Attribution example
 
-> PixelPainter — created by Bootdsc for all you Chooms to use, copy, and modify.  
+> PixelPerfect — created by Bootdsc for all you Chooms to use, copy, and modify.  
 > Licensed under CC BY-NC-SA 4.0.
